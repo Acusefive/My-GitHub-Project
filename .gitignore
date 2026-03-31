@@ -45,3 +45,10 @@ checkpoints/
 runs/
 results/
 artifacts/
+
+# logs / results
+MOOC-Radar-main/log/
+MOOC-Radar-main/result/
+
+# local preview/temp
+context_text_preview.txt

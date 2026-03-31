@@ -1,0 +1,7 @@
+torch
+sentence-transformers
+numpy
+scikit-learn
+jieba
+gensim
+tqdm

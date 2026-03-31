@@ -45,6 +45,9 @@ checkpoints/
 runs/
 results/
 artifacts/
+out/
+cachelocal/
+datalocal/
 
 # logs / results
 MOOC-Radar-main/log/

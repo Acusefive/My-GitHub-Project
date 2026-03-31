@@ -1,0 +1,329 @@
+================================================================================
+示例 1
+================================================================================
+目标题目ID: Pm_696319
+目标题目语义ID: 进程-进程-操作系统
+历史题目数量: 9
+随机检索数量: 4
+认知检索数量: 4
+真实答案: 错误
+
+
+【Random Baseline Prompt】
+--------------------------------------------------------------------------------
+[SYSTEM ROLE]: You are an expert in Bloom's Taxonomy for educational assessment.
+
+[USER TRAJECTORY (Coarse-grained)]:
+  软件-软件-微课: Correct
+  软件-软件-微课: Correct
+  进程-进程-操作系统: Correct
+  进程-进程-操作系统: Incorrect
+  进程-内存-lt: Correct
+  进程-进程-操作系统: Incorrect
+  进程-进程-操作系统: Incorrect
+  进程-进程-操作系统: Correct
+  进程-进程-操作系统: Correct
+
+[RETRIEVED CONTEXT (Fine-grained)]:
+Question ID: 进程-进程-操作系统
+  Collaborative: 进程-进程-操作系统, 进程-进程-操作系统, 进程-进程-操作系统
+  Cognitive: Concepts: 系统调用, 库函数, 操作系统, Level: 2
+  Content: (2010统考）下列选项中，操作系统提供给应用程序的接口是（ ）
+  Result: Correct
+
+  Question ID: 软件-软件-微课
+  Collaborative: 软件-软件-微课, 进程-进程-操作系统, 进程-进程-操作系统
+  Cognitive: Concepts: 操作系统, 应用软件, Level: 2
+  Content: 以下哪个不能用于描述操作系统
+  Result: Correct
+
+  Question ID: 进程-进程-操作系统
+  Collaborative: 进程-进程-操作系统, 进程-进程-操作系统, 进程-进程-操作系统
+  Cognitive: Concepts: 用户态, 命令解释程序, 操作系统, Level: 2
+  Content: (2011统考)下列选项中，在用户态执行的是（ ）
+  Result: Correct
+
+  Question ID: 进程-进程-操作系统
+  Collaborative: 软件-软件-微课, 软件-软件-微课, 进程-进程-操作系统
+  Cognitive: Concepts: 多道程序设计, 效率, 操作系统, Level: 2
+  Content: 操作系统中的多道程序设计方式用于提高____
+  Result: Correct
+
+[TARGET PROBLEM]:
+  Question ID: 进程-进程-操作系统
+  Collaborative: 进程-进程-操作系统, 进程-进程-操作系统, 进程-进程-操作系统
+  Cognitive: Concepts: 操作系统, Level: 2
+  Content: (2013联考)计算机开机后，操作系统最终被加载到（ ）
+
+[INSTRUCTION]: Based on the cognitive hierarchy and collaborative signals, predict whether the student will answer the target question correctly. Output only 0 (incorrect) or 1 (correct).
+
+
+【Cognitive-RAG Prompt】
+--------------------------------------------------------------------------------
+[SYSTEM ROLE]: You are an expert in Bloom's Taxonomy for educational assessment.
+
+[USER TRAJECTORY (Coarse-grained)]:
+  软件-软件-微课: Correct
+  软件-软件-微课: Correct
+  进程-进程-操作系统: Correct
+  进程-进程-操作系统: Incorrect
+  进程-内存-lt: Correct
+  进程-进程-操作系统: Incorrect
+  进程-进程-操作系统: Incorrect
+  进程-进程-操作系统: Correct
+  进程-进程-操作系统: Correct
+
+[RETRIEVED CONTEXT (Fine-grained)]:
+Question ID: 进程-内存-lt
+  Collaborative: 进程-进程-操作系统, 进程-进程-操作系统, 进程-进程-操作系统
+  Cognitive: Concepts: 批处理, 并行性, 操作系统, Level: 2
+  Content: 批处理的主要缺点是____()
+  Result: Correct
+
+  Question ID: 进程-进程-操作系统
+  Collaborative: 进程-内存-lt, 进程-进程-操作系统, 进程-进程-操作系统
+  Cognitive: Concepts: 资源管理, 操作系统, Level: 2
+  Content: 关于操作系统，说法正确的是（）
+  Result: Incorrect
+
+  Question ID: 进程-进程-操作系统
+  Collaborative: 进程-进程-操作系统, 进程-进程-操作系统, 进程-进程-操作系统
+  Cognitive: Concepts: 系统调用, 库函数, 操作系统, Level: 2
+  Content: (2010统考）下列选项中，操作系统提供给应用程序的接口是（ ）
+  Result: Correct
+
+  Question ID: 进程-进程-操作系统
+  Collaborative: 进程-进程-操作系统, 进程-进程-操作系统, 进程-进程-操作系统
+  Cognitive: Concepts: 用户态, 命令解释程序, 操作系统, Level: 2
+  Content: (2011统考)下列选项中，在用户态执行的是（ ）
+  Result: Correct
+
+[TARGET PROBLEM]:
+  Question ID: 进程-进程-操作系统
+  Collaborative: 进程-进程-操作系统, 进程-进程-操作系统, 进程-进程-操作系统
+  Cognitive: Concepts: 操作系统, Level: 2
+  Content: (2013联考)计算机开机后，操作系统最终被加载到（ ）
+
+[INSTRUCTION]: Based on the cognitive hierarchy and collaborative signals, predict whether the student will answer the target question correctly. Output only 0 (incorrect) or 1 (correct).
+
+
+================================================================================
+示例 2
+================================================================================
+目标题目ID: Pm_5966886
+目标题目语义ID: 反馈-负反馈-反馈
+历史题目数量: 50
+随机检索数量: 4
+认知检索数量: 4
+真实答案: 错误
+
+
+【Random Baseline Prompt】
+--------------------------------------------------------------------------------
+[SYSTEM ROLE]: You are an expert in Bloom's Taxonomy for educational assessment.
+
+[USER TRAJECTORY (Coarse-grained)]:
+  反馈-反馈-负反馈: Incorrect
+  反馈-放大-反馈: Incorrect
+  反馈-反馈-负反馈: Incorrect
+  反馈-负反馈-反馈: Correct
+  反馈-负反馈-反馈: Incorrect
+  反馈-负反馈-反馈: Correct
+  反馈-负反馈-反馈: Correct
+  反馈-负反馈-反馈: Incorrect
+  反馈-负反馈-反馈: Incorrect
+  反馈-负反馈-反馈: Correct
+
+[RETRIEVED CONTEXT (Fine-grained)]:
+Question ID: 放大-放大-电路
+  Collaborative: 电路-信号-输入, 电路-信号-输入, 电路-信号-输入
+  Cognitive: Concepts: 单端输入双端输出, 差分放大电路, Level: 1
+  Content: （5）单端输出差分放大电路的输出电压等于差模电压放大倍数与输入电压之积。
+  Result: Incorrect
+
+  Question ID: 电路-信号-输入
+  Collaborative: 电路-信号-输入, 电路-信号-输入, 电路-信号-输入
+  Cognitive: Concepts: 单端输入双端输出, 差分放大电路, Level: 2
+  Content: 单端输入双端输出差分放大电路、四种接法比较判断下列说法是否正确，对者选“YES”错者选“NO”。（1）单端输入差分放大电路的差模输入信号等于该输入端信号。
+  Result: Correct
+
+  Question ID: 放大-电路-放大
+  Collaborative: 电路-信号-输入, 电路-信号-输入, 电路-信号-输入
+  Cognitive: Concepts: 零点漂移, Level: 1
+  Content: 零点漂移现象及差分放大电路的组成判断下列说法是否正确，对者选“YES”错者选“NO”。（1）输入电压为零而输出电压不为零的现象称为零点漂移现象。
+  Result: Correct
+
+  Question ID: 反馈-放大-反馈
+  Collaborative: 反馈-放大-反馈, 反馈-放大-反馈, 反馈-放大-反馈
+  Cognitive: Concepts: 反馈, 深度负反馈条件, Level: 2
+  Content: 既然深度负反馈条件下，放大倍数，那么就可以省去放大通路，仅留下反馈网络，来获得稳定的闭环放大倍数。
+  Result: Incorrect
+
+[TARGET PROBLEM]:
+  Question ID: 反馈-负反馈-反馈
+  Collaborative: 反馈-负反馈-反馈, 反馈-负反馈-反馈, 反馈-负反馈-反馈
+  Cognitive: Concepts: 反馈, 电流并联负反馈, Level: 2
+  Content: 接上题，而电流并联负反馈增大Ro。
+
+[INSTRUCTION]: Based on the cognitive hierarchy and collaborative signals, predict whether the student will answer the target question correctly. Output only 0 (incorrect) or 1 (correct).
+
+
+【Cognitive-RAG Prompt】
+--------------------------------------------------------------------------------
+[SYSTEM ROLE]: You are an expert in Bloom's Taxonomy for educational assessment.
+
+[USER TRAJECTORY (Coarse-grained)]:
+  反馈-反馈-负反馈: Incorrect
+  反馈-放大-反馈: Incorrect
+  反馈-反馈-负反馈: Incorrect
+  反馈-负反馈-反馈: Correct
+  反馈-负反馈-反馈: Incorrect
+  反馈-负反馈-反馈: Correct
+  反馈-负反馈-反馈: Correct
+  反馈-负反馈-反馈: Incorrect
+  反馈-负反馈-反馈: Incorrect
+  反馈-负反馈-反馈: Correct
+
+[RETRIEVED CONTEXT (Fine-grained)]:
+Question ID: 反馈-负反馈-反馈
+  Collaborative: 反馈-负反馈-反馈, 反馈-负反馈-反馈, 反馈-负反馈-反馈
+  Cognitive: Concepts: 电压并联负反馈, 反馈, Level: 2
+  Content: 电压并联负反馈减小Ri，
+  Result: Correct
+
+  Question ID: 反馈-负反馈-反馈
+  Collaborative: 反馈-负反馈-反馈, 反馈-负反馈-反馈, 反馈-负反馈-反馈
+  Cognitive: Concepts: 反馈, 电流并联负反馈, Level: 2
+  Content: 接上题，而电流并联负反馈增大Ri。
+  Result: Correct
+
+  Question ID: 反馈-负反馈-反馈
+  Collaborative: 反馈-负反馈-反馈, 反馈-负反馈-反馈, 反馈-负反馈-反馈
+  Cognitive: Concepts: 反馈, 电流串联负反馈, Level: 2
+  Content: 电流串联负反馈增大Ro，
+  Result: Incorrect
+
+  Question ID: 反馈-负反馈-反馈
+  Collaborative: 反馈-负反馈-反馈, 反馈-负反馈-反馈, 反馈-负反馈-反馈
+  Cognitive: Concepts: 反馈, 电压串联负反馈, Level: 2
+  Content: 接上题，而电压串联负反馈减小Ro。
+  Result: Incorrect
+
+[TARGET PROBLEM]:
+  Question ID: 反馈-负反馈-反馈
+  Collaborative: 反馈-负反馈-反馈, 反馈-负反馈-反馈, 反馈-负反馈-反馈
+  Cognitive: Concepts: 反馈, 电流并联负反馈, Level: 2
+  Content: 接上题，而电流并联负反馈增大Ro。
+
+[INSTRUCTION]: Based on the cognitive hierarchy and collaborative signals, predict whether the student will answer the target question correctly. Output only 0 (incorrect) or 1 (correct).
+
+
+================================================================================
+示例 3
+================================================================================
+目标题目ID: Pm_3551952
+目标题目语义ID: 白酒-制作-大曲
+历史题目数量: 9
+随机检索数量: 4
+认知检索数量: 4
+真实答案: 正确
+
+
+【Random Baseline Prompt】
+--------------------------------------------------------------------------------
+[SYSTEM ROLE]: You are an expert in Bloom's Taxonomy for educational assessment.
+
+[USER TRAJECTORY (Coarse-grained)]:
+  白酒-白酒-调味: Correct
+  白酒-白酒-发酵: Incorrect
+  白酒-白酒-调味: Correct
+  白酒-白酒-调味: Correct
+  白酒-全国-酒会: Incorrect
+  白酒-白酒-香型: Incorrect
+  白酒-糖化-发酵剂: Correct
+  白酒-糖化-发酵剂: Correct
+  白酒-大曲-制作: Incorrect
+
+[RETRIEVED CONTEXT (Fine-grained)]:
+Question ID: 白酒-白酒-发酵
+  Collaborative: 白酒-白酒-调味, 白酒-白酒-调味, 白酒-白酒-调味
+  Cognitive: Concepts: 黄酒, 发酵酒, Level: 2
+  Content: 黄酒是（ ）
+  Result: Incorrect
+
+  Question ID: 白酒-大曲-制作
+  Collaborative: 白酒-制作-大曲, 白酒-糖化-发酵剂, 白酒-糖化-发酵剂
+  Cognitive: Concepts: 大曲制作, Level: 3
+  Content: 大曲的制作具有以下四个特征（ ）
+  Result: Incorrect
+
+  Question ID: 白酒-白酒-香型
+  Collaborative: 白酒-糖化-发酵剂, 白酒-糖化-发酵剂, 白酒-大曲-制作
+  Cognitive: Concepts: 勾兑, 香型, 白酒勾兑技术, Level: 2
+  Content: 20世纪（  ）年代，在研究香型的基础上，出现了真正意义上的白酒勾兑技术。
+  Result: Incorrect
+
+  Question ID: 白酒-白酒-调味
+  Collaborative: 白酒-白酒-调味, 白酒-全国-酒会, 白酒-白酒-发酵
+  Cognitive: Concepts: 基本香型, 白酒, 白酒香型, Level: 2
+  Content: 白酒四种基本香型为（ ）
+  Result: Correct
+
+[TARGET PROBLEM]:
+  Question ID: 白酒-制作-大曲
+  Collaborative: 白酒-大曲-制作, 白酒-糖化-发酵剂, 白酒-糖化-发酵剂
+  Cognitive: Concepts: 培菌, 大曲制作, Level: 2
+  Content: 培菌过程的管理大致可分成四个阶段，下列不属于该四个阶段的是（  ）。
+
+[INSTRUCTION]: Based on the cognitive hierarchy and collaborative signals, predict whether the student will answer the target question correctly. Output only 0 (incorrect) or 1 (correct).
+
+
+【Cognitive-RAG Prompt】
+--------------------------------------------------------------------------------
+[SYSTEM ROLE]: You are an expert in Bloom's Taxonomy for educational assessment.
+
+[USER TRAJECTORY (Coarse-grained)]:
+  白酒-白酒-调味: Correct
+  白酒-白酒-发酵: Incorrect
+  白酒-白酒-调味: Correct
+  白酒-白酒-调味: Correct
+  白酒-全国-酒会: Incorrect
+  白酒-白酒-香型: Incorrect
+  白酒-糖化-发酵剂: Correct
+  白酒-糖化-发酵剂: Correct
+  白酒-大曲-制作: Incorrect
+
+[RETRIEVED CONTEXT (Fine-grained)]:
+Question ID: 白酒-大曲-制作
+  Collaborative: 白酒-制作-大曲, 白酒-糖化-发酵剂, 白酒-糖化-发酵剂
+  Cognitive: Concepts: 大曲制作, Level: 3
+  Content: 大曲的制作具有以下四个特征（ ）
+  Result: Incorrect
+
+  Question ID: 白酒-全国-酒会
+  Collaborative: 白酒-白酒-调味, 白酒-白酒-调味, 白酒-白酒-香型
+  Cognitive: Concepts: 国家级名酒, 全国评酒会, 国家级白酒, Level: 1
+  Content: 第一届全国评酒会从一百多种酒中，共评出8种国家级名洒，其中白酒4种，分别是（）
+  Result: Incorrect
+
+  Question ID: 白酒-糖化-发酵剂
+  Collaborative: 白酒-糖化-发酵剂, 白酒-白酒-香型, 白酒-大曲-制作
+  Cognitive: Concepts: 传统酒曲, 糖化发酵剂, Level: 1
+  Content: 白酒生产中使用的糖化发酵剂种类较多，大体上可分为以下（  ）三类。
+  Result: Correct
+
+  Question ID: 白酒-白酒-香型
+  Collaborative: 白酒-糖化-发酵剂, 白酒-糖化-发酵剂, 白酒-大曲-制作
+  Cognitive: Concepts: 勾兑, 香型, 白酒勾兑技术, Level: 2
+  Content: 20世纪（  ）年代，在研究香型的基础上，出现了真正意义上的白酒勾兑技术。
+  Result: Incorrect
+
+[TARGET PROBLEM]:
+  Question ID: 白酒-制作-大曲
+  Collaborative: 白酒-大曲-制作, 白酒-糖化-发酵剂, 白酒-糖化-发酵剂
+  Cognitive: Concepts: 培菌, 大曲制作, Level: 2
+  Content: 培菌过程的管理大致可分成四个阶段，下列不属于该四个阶段的是（  ）。
+
+[INSTRUCTION]: Based on the cognitive hierarchy and collaborative signals, predict whether the student will answer the target question correctly. Output only 0 (incorrect) or 1 (correct).
+
+

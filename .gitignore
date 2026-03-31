@@ -1,0 +1,47 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# virtual env
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# logs / temp
+logs/
+tmp/
+temp/
+*.log
+
+# model checkpoints / weights
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# arrays / embeddings / cached features
+*.pkl
+*.npy
+*.npz
+
+# dataset files
+student-problem-fine.json
+problem.json
+prompt_samples.json
+item_collaborative.json
+item_semantic_ids.json
+
+# generic data/output dirs
+data/
+outputs/
+checkpoints/
+runs/
+results/
+artifacts/

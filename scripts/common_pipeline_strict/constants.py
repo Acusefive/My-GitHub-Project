@@ -2,33 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-try:
-    from preprocess_gram import CUSTOM_STOP_WORDS as BASE_STOP_WORDS
-except Exception:
-    BASE_STOP_WORDS = {
-        "的",
-        "了",
-        "和",
-        "是",
-        "在",
-        "与",
-        "及",
-        "或",
-        "关于",
-        "下列",
-        "正确",
-        "错误",
-        "题目",
-        "内容",
-        "问题",
-        "单选",
-        "分析",
-        "解答",
-        "答案",
-        "过程",
-        "步骤",
-    }
-
 BGE_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
 
 DS = 256
@@ -46,6 +19,7 @@ RASCH_EPOCHS = 6
 RASCH_LR = 0.05
 RASCH_LAMBDA_MU = 1.0
 RASCH_LAMBDA_THETA = 0.1
+USE_RASCH_ENHANCEMENT = False
 
 HISTORY_WINDOW = 20
 COLLAB_WINDOW = 5
@@ -53,11 +27,12 @@ NEGATIVE_SAMPLES = 5
 LOCAL_COOCCUR_THRESHOLD = 3
 
 TRAIN_SEED = 42
-TRAIN_LR = 1e-3
+TRAIN_LR = 5e-4
 TRAIN_BATCH_SIZE = 1024
 TRAIN_MAX_EPOCHS = 5
 TRAIN_EARLY_STOP_PATIENCE = 2
 TRAIN_VAL_MOD = 10
+TRAIN_GRAD_CLIP = 1.0
 
 K1_DEFAULT = 30
 K2_DEFAULT = 6
@@ -140,6 +115,7 @@ SUMMARY_TEMPLATE = (
 )
 
 QUESTION_TEXT_LIMIT = 80
+QUESTION_TEXT_ELLIPSIS = "…"
 SUPPORT_SCORE_DECIMALS = 4
 
 SMOKE_MAX_PROBLEMS = 256
@@ -149,5 +125,50 @@ SMOKE_TRAIN_MAX_SAMPLES = 4096
 
 DEFAULT_OUT_ROOT = Path("out") / "strict_common_pipeline"
 
-STOP_WORDS = set(BASE_STOP_WORDS)
-
+STOP_WORDS = {
+    "一个",
+    "一种",
+    "这个",
+    "那个",
+    "我们",
+    "你们",
+    "他们",
+    "以及",
+    "因为",
+    "所以",
+    "如果",
+    "关于",
+    "以下",
+    "下列",
+    "上面",
+    "下面",
+    "其中",
+    "根据",
+    "通常",
+    "主要",
+    "有关",
+    "可以",
+    "属于",
+    "正确",
+    "错误",
+    "题目",
+    "内容",
+    "问题",
+    "单选",
+    "多选",
+    "分析",
+    "解答",
+    "解析",
+    "答案",
+    "过程",
+    "步骤",
+    "如图",
+    "所示",
+    "进行",
+    "命题",
+    "作业",
+    "习题",
+    "测试",
+    "nbsp",
+    "br",
+}

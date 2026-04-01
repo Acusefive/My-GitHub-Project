@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 
-from .constants import K1_DEFAULT, K2_DEFAULT, QUESTION_TEXT_LIMIT, ROLE_LABELS, SUPPORT_SCORE_DECIMALS
+from .constants import K1_DEFAULT, K2_DEFAULT, QUESTION_TEXT_ELLIPSIS, QUESTION_TEXT_LIMIT, ROLE_LABELS, SUPPORT_SCORE_DECIMALS
 from .io_utils import ProblemRecord, write_json
 from .stage32 import build_semantic_ids
 
@@ -132,8 +132,11 @@ def run_validation(
                 failures.append(f"support_score_precision_invalid:{record['user_id']}:{target_t}")
                 break
             q_text = str(evidence["question_text"])
-            if len(q_text) > QUESTION_TEXT_LIMIT:
+            if len(q_text) > QUESTION_TEXT_LIMIT + len(QUESTION_TEXT_ELLIPSIS):
                 failures.append(f"question_text_too_long:{record['user_id']}:{target_t}")
+                break
+            if len(q_text) > QUESTION_TEXT_LIMIT and not q_text.endswith(QUESTION_TEXT_ELLIPSIS):
+                failures.append(f"question_text_missing_ellipsis:{record['user_id']}:{target_t}")
                 break
             history_positions.append(int(evidence["history_pos"]))
         if failures:

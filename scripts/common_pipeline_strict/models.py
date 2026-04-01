@@ -53,16 +53,10 @@ class StrictPriorModel(nn.Module):
         self.dynamic = DynamicPriorMLP()
         self.W_diag = nn.Parameter(torch.empty(DS, DD))
         self.b_diag = nn.Parameter(torch.zeros(1))
-        self.w_summary = nn.Parameter(torch.empty(DD))
-        self.b_summary = nn.Parameter(torch.zeros(1))
         nn.init.xavier_uniform_(self.W_diag)
-        nn.init.normal_(self.w_summary, mean=0.0, std=0.02)
 
     def diag_logits(self, eq_vec: torch.Tensor, d_vec: torch.Tensor) -> torch.Tensor:
         return torch.sum(eq_vec @ self.W_diag * d_vec, dim=-1) + self.b_diag
-
-    def summary_logits(self, d_vec: torch.Tensor) -> torch.Tensor:
-        return torch.sum(d_vec * self.w_summary, dim=-1) + self.b_summary
 
 
 @dataclass
@@ -81,4 +75,3 @@ def load_strict_prior_model(model_state_path: str, map_location: str = "cpu") ->
         model.load_state_dict(state)
     model.eval()
     return model
-

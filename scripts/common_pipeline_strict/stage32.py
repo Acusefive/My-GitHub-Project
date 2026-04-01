@@ -49,10 +49,12 @@ from .constants import (
     TAU,
     TRAIN_BATCH_SIZE,
     TRAIN_EARLY_STOP_PATIENCE,
+    TRAIN_GRAD_CLIP,
     TRAIN_LR,
     TRAIN_MAX_EPOCHS,
     TRAIN_SEED,
     TRAIN_VAL_MOD,
+    USE_RASCH_ENHANCEMENT,
 )
 from .io_utils import (
     ProblemRecord,
@@ -109,6 +111,17 @@ def _jieba_tokenizer(text: str) -> List[str]:
     return [token for token in jieba.lcut(text) if len(token) > 1 and token not in STOP_WORDS]
 
 
+def canonicalize_cluster_labels(labels: np.ndarray) -> np.ndarray:
+    unique_labels = sorted(int(label) for label in np.unique(labels))
+    ordered_groups: List[Tuple[Tuple[int, ...], int]] = []
+    for old_label in unique_labels:
+        members = tuple(int(idx) for idx in np.where(labels == old_label)[0].tolist())
+        ordered_groups.append((members, old_label))
+    ordered_groups.sort()
+    label_map = {old_label: new_label for new_label, (_members, old_label) in enumerate(ordered_groups)}
+    return np.asarray([label_map[int(label)] for label in labels], dtype=np.int64)
+
+
 def normalize_vecs(matrix: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     norms = np.where(norms <= 0, 1.0, norms)
@@ -156,11 +169,15 @@ def compute_ctfidf_labels(
 
 
 def pick_top_token_from_ctfidf(ctfidf: np.ndarray, vocab: np.ndarray) -> str:
-    indices = np.argsort(ctfidf)[::-1]
-    for idx in indices[:20]:
+    candidates: List[Tuple[float, str]] = []
+    for idx, score in enumerate(ctfidf.tolist()):
         token = str(vocab[int(idx)])
-        if token and token not in STOP_WORDS:
-            return token
+        if not token or token in STOP_WORDS:
+            continue
+        candidates.append((float(score), token))
+    if candidates:
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        return candidates[0][1]
     return "misc"
 
 
@@ -174,7 +191,7 @@ def build_semantic_ids(
     texts = [problem.text or problem.title or problem.problem_id for problem in problem_records]
     k1 = min(KGLOBAL, len(problem_ids))
     km1 = KMeans(n_clusters=k1, random_state=KMEANS_RANDOM_STATE, n_init=KMEANS_N_INIT)
-    labels1 = km1.fit_predict(text_vectors)
+    labels1 = canonicalize_cluster_labels(km1.fit_predict(text_vectors))
     macro_labels = compute_ctfidf_labels(texts, labels1, max_features=CTFIDF_MAX_FEATURES)
 
     semantic_ids: Dict[str, str] = {}
@@ -189,7 +206,7 @@ def build_semantic_ids(
             labels2 = np.zeros((len(idxs),), dtype=np.int64)
         else:
             km2 = KMeans(n_clusters=k2, random_state=KMEANS_RANDOM_STATE, n_init=KMEANS_N_INIT)
-            labels2 = km2.fit_predict(sub_vectors)
+            labels2 = canonicalize_cluster_labels(km2.fit_predict(sub_vectors))
         sub_texts = [texts[int(idx)] for idx in idxs]
         micro_labels = compute_ctfidf_labels(sub_texts, labels2, max_features=CTFIDF_MAX_FEATURES)
         for local_pos, global_idx in enumerate(idxs):
@@ -447,6 +464,10 @@ def build_target_samples(
     rng = random.Random(seed)
     rng.shuffle(train_samples)
     rng.shuffle(val_samples)
+    if not val_samples and train_samples:
+        fallback_val = max(1, min(len(train_samples) // 10, 32))
+        val_samples = train_samples[:fallback_val]
+        train_samples = train_samples[fallback_val:]
     if smoke:
         train_samples = train_samples[:SMOKE_TRAIN_MAX_SAMPLES]
         val_samples = val_samples[: max(1, SMOKE_TRAIN_MAX_SAMPLES // 8)]
@@ -459,6 +480,8 @@ def _batch_loss(
     sequence_cache: Sequence[Dict[str, Any]],
     hqtext_tensor: torch.Tensor,
     hqid_tensor: torch.Tensor,
+    problem_dcq: np.ndarray,
+    mu_values: np.ndarray,
     *,
     device: str,
 ) -> torch.Tensor:
@@ -476,6 +499,9 @@ def _batch_loss(
         hqtext_tensor[sorted_unique].to(device),
         hqid_tensor[sorted_unique].to(device),
     )
+    dcq_local = torch.tensor(problem_dcq[sorted_unique], dtype=torch.float32, device=device)
+    mu_local = torch.tensor(mu_values[sorted_unique], dtype=torch.float32, device=device).unsqueeze(-1)
+    eqsem_local = eqbase_local + mu_local * dcq_local
 
     z_rows: List[torch.Tensor] = []
     target_eq_rows: List[torch.Tensor] = []
@@ -484,7 +510,7 @@ def _batch_loss(
     for seq_idx, t in batch_samples:
         sequence = sequence_cache[seq_idx]
         target_idx = int(sequence["problem_indices"][t])
-        target_eq = eqbase_local[local_pos[target_idx]]
+        target_eq = eqsem_local[local_pos[target_idx]]
         target_level = int(sequence["levels"][t])
 
         history_start = max(0, t - HISTORY_WINDOW)
@@ -497,7 +523,7 @@ def _batch_loss(
             labels.append(float(sequence["results"][t]))
             continue
 
-        hist_eq = torch.stack([eqbase_local[local_pos[int(pid_idx)]] for pid_idx in hist_problem_indices], dim=0)
+        hist_eq = torch.stack([eqsem_local[local_pos[int(pid_idx)]] for pid_idx in hist_problem_indices], dim=0)
         hist_eq_norm = F.normalize(hist_eq, dim=-1)
         target_eq_norm = F.normalize(target_eq.unsqueeze(0), dim=-1).squeeze(0)
         cos_scores = torch.sum(hist_eq_norm * target_eq_norm.unsqueeze(0), dim=-1)
@@ -536,10 +562,8 @@ def _batch_loss(
 
     d_batch = model.dynamic(z_batch)
     diag_logits = model.diag_logits(target_eq_batch, d_batch)
-    summary_logits = model.summary_logits(d_batch)
     loss_diag = F.binary_cross_entropy_with_logits(diag_logits, y)
-    loss_summary = F.binary_cross_entropy_with_logits(summary_logits, y)
-    return 0.5 * (loss_diag + loss_summary)
+    return loss_diag
 
 
 def train_strict_model(
@@ -547,6 +571,7 @@ def train_strict_model(
     student_sequences: Sequence[StudentSequence],
     hqtext_vectors: np.ndarray,
     hqid_vectors: np.ndarray,
+    mu_values: np.ndarray,
     *,
     priors_dir: Path,
     smoke: bool,
@@ -563,6 +588,20 @@ def train_strict_model(
     hqtext_tensor = torch.tensor(hqtext_vectors.astype(np.float32), dtype=torch.float32)
     hqid_tensor = torch.tensor(hqid_vectors.astype(np.float32), dtype=torch.float32)
 
+    def refresh_problem_dcq() -> np.ndarray:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            eqbase_all = model.eqbase(
+                hqtext_tensor.to(device),
+                hqid_tensor.to(device),
+            ).detach().cpu().tolist()
+        if was_training:
+            model.train()
+        eqbase_all_np = np.asarray(eqbase_all, dtype=np.float32)
+        concept_pc1_dirs = build_concept_pc1_directions(problem_records, eqbase_all_np)
+        return build_problem_concept_directions(problem_records, concept_pc1_dirs)
+
     best_val = float("inf")
     best_state: Optional[Dict[str, torch.Tensor]] = None
     patience_left = TRAIN_EARLY_STOP_PATIENCE
@@ -570,6 +609,7 @@ def train_strict_model(
 
     for epoch in range(1, TRAIN_MAX_EPOCHS + 1):
         model.train()
+        problem_dcq_train = refresh_problem_dcq()
         random.Random(seed + epoch).shuffle(train_samples)
         train_losses: List[float] = []
         for start in tqdm(range(0, len(train_samples), TRAIN_BATCH_SIZE), desc=f"strict train epoch {epoch}"):
@@ -583,13 +623,17 @@ def train_strict_model(
                 sequence_cache,
                 hqtext_tensor,
                 hqid_tensor,
+                problem_dcq_train,
+                mu_values,
                 device=device,
             )
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), TRAIN_GRAD_CLIP)
             optimizer.step()
             train_losses.append(float(loss.detach().cpu().item()))
 
         model.eval()
+        problem_dcq_val = refresh_problem_dcq()
         val_losses: List[float] = []
         with torch.no_grad():
             for start in range(0, len(val_samples), TRAIN_BATCH_SIZE):
@@ -602,6 +646,8 @@ def train_strict_model(
                     sequence_cache,
                     hqtext_tensor,
                     hqid_tensor,
+                    problem_dcq_val,
+                    mu_values,
                     device=device,
                 )
                 val_losses.append(float(loss.detach().cpu().item()))
@@ -630,8 +676,8 @@ def train_strict_model(
         "epochs_ran": len(history),
         "history": history,
         "assumptions": {
-            "joint_loss": "0.5 * BCE(diag_head, y) + 0.5 * BCE(summary_head, y)",
-            "eqsem_training_phase": "train eqbase/dynamic heads on eqbase, then derive concept directions in eqbase latent space",
+            "joint_loss": "BCE(diag_head(eqsem, d), y)",
+            "eqsem_training_phase": "refresh concept directions from current eqbase each epoch and train with eqsem = eqbase + mu_q * d_c(q)",
         },
     }
     model_state_path = priors_dir / "model_state.pt"
@@ -691,12 +737,21 @@ def run_stage32(
     hqid_vectors = np.asarray(hqid_vectors.tolist(), dtype=np.float32)
 
     pid_to_idx = {problem.problem_id: idx for idx, problem in enumerate(problem_records)}
-    pid_to_mu_q = estimate_rasch_mu_q(student_sequences, pid_to_idx, seed=seed)
+    pid_to_mu_q = (
+        estimate_rasch_mu_q(student_sequences, pid_to_idx, seed=seed)
+        if USE_RASCH_ENHANCEMENT
+        else {problem.problem_id: 0.0 for problem in problem_records}
+    )
+    mu_values = np.asarray(
+        [pid_to_mu_q.get(problem.problem_id, 0.0) for problem in problem_records],
+        dtype=np.float32,
+    )
     model_torch, training_report = train_strict_model(
         problem_records,
         student_sequences,
         hqtext_vectors,
         hqid_vectors,
+        mu_values,
         priors_dir=priors_dir,
         smoke=smoke,
         seed=seed,
@@ -710,7 +765,7 @@ def run_stage32(
 
     concept_pc1_dirs = build_concept_pc1_directions(problem_records, eqbase_vectors)
     problem_dcq = build_problem_concept_directions(problem_records, concept_pc1_dirs)
-    mu_arr = np.asarray([pid_to_mu_q.get(problem.problem_id, 0.0) for problem in problem_records], dtype=np.float32).reshape(-1, 1)
+    mu_arr = mu_values.reshape(-1, 1)
     eqsem_vectors = eqbase_vectors + mu_arr * problem_dcq
     eqsem_vectors = eqsem_vectors.astype(np.float32)
 
@@ -764,6 +819,9 @@ def run_stage32(
         "negative_samples": NEGATIVE_SAMPLES,
         "local_cooccur_threshold": LOCAL_COOCCUR_THRESHOLD,
         "rasch_a": A_SCALE,
+        "use_rasch_enhancement": USE_RASCH_ENHANCEMENT,
+        "train_lr": TRAIN_LR,
+        "train_grad_clip": TRAIN_GRAD_CLIP,
         "lambda_l": LAMBDA_L,
         "lambda_t": LAMBDA_T,
         "tau": TAU,

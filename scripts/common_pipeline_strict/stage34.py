@@ -5,7 +5,7 @@ import math
 import pickle
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -28,6 +28,7 @@ from .constants import (
     K2_DEFAULT,
     LAMBDA_COV,
     LAMBDA_RED,
+    QUESTION_TEXT_ELLIPSIS,
     QUESTION_TEXT_LIMIT,
     REDUNDANCY_WEIGHTS,
     ROLE_LABELS,
@@ -41,8 +42,6 @@ from .constants import (
     WEIGHT_STAGE2,
 )
 from .io_utils import (
-    ProblemRecord,
-    StudentSequence,
     atomic_save_text,
     ensure_dir,
     format_float,
@@ -72,8 +71,6 @@ def _normalize_matrix(matrix: np.ndarray) -> np.ndarray:
 def _jaccard(left: Sequence[str], right: Sequence[str]) -> float:
     set_left = set(left)
     set_right = set(right)
-    if not set_left and not set_right:
-        return 0.0
     if not set_left or not set_right:
         return 0.0
     return float(len(set_left & set_right)) / float(len(set_left | set_right))
@@ -87,7 +84,7 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _scaled_cosine(a: np.ndarray, b: np.ndarray) -> float:
-    return (1.0 + _cosine(a, b)) / 2.0
+    return _cosine(a, b)
 
 
 def _clip01(value: float) -> float:
@@ -98,7 +95,7 @@ def _question_text(text: str) -> str:
     text = " ".join(str(text or "").split())
     if len(text) <= QUESTION_TEXT_LIMIT:
         return text
-    return text[:QUESTION_TEXT_LIMIT]
+    return text[:QUESTION_TEXT_LIMIT] + QUESTION_TEXT_ELLIPSIS
 
 
 def _role_from_candidate(candidate: Dict[str, Any]) -> str:
@@ -130,12 +127,10 @@ class GraphAccessor:
     def problem_neighbors(self, pid: str) -> List[str]:
         return list(self.problem_neighbor_concepts.get(pid, []))
 
-    def graw(self, concepts_i: Sequence[str], concepts_t: Sequence[str]) -> float:
+    def structural_bonus(self, concepts_i: Sequence[str], concepts_t: Sequence[str]) -> float:
         best = 0.0
         target_set = set(concepts_t)
         for concept_i in concepts_i:
-            if concept_i in target_set:
-                best = max(best, 1.0)
             neigh = self.concept_neighbors.get(concept_i, set())
             if neigh & target_set:
                 best = max(best, 0.5 * math.exp(-DELTA_GRAPH * 1.0))
@@ -202,6 +197,7 @@ def _compute_dynamic_prior(
                 axis=0,
             )
         )
+
     s_arr = np.asarray(s_values, dtype=np.float32)
     s_arr = s_arr - np.max(s_arr)
     alpha = np.exp(s_arr)
@@ -211,7 +207,8 @@ def _compute_dynamic_prior(
     with torch.no_grad():
         z_t = torch.tensor(z, dtype=torch.float32).unsqueeze(0)
         d_tensor = model.dynamic(z_t).squeeze(0).to(torch.float32)
-        sdyn = torch.sigmoid(model.summary_logits(d_tensor.unsqueeze(0))).cpu().item()
+        qt_tensor = torch.tensor(qt_vec, dtype=torch.float32).unsqueeze(0)
+        sdyn = torch.sigmoid(model.diag_logits(qt_tensor, d_tensor.unsqueeze(0))).cpu().item()
         d_vec = np.asarray(d_tensor.cpu().tolist(), dtype=np.float32)
     return z, d_vec, float(sdyn)
 
@@ -242,7 +239,6 @@ def _candidate_scores(
     delta_l = int(meta_t["cognitive_dimension"]) - int(meta_i["cognitive_dimension"])
 
     eq_i = eqsem[seq_problem_indices[hist_pos]]
-    eq_t = eqsem[seq_problem_indices[current_t]]
     eq_i_norm = eqsem_norm[seq_problem_indices[hist_pos]]
     eq_t_norm = eqsem_norm[seq_problem_indices[current_t]]
 
@@ -267,7 +263,8 @@ def _candidate_scores(
             -GAMMA_HIGH * abs(delta_l)
         )
 
-    graw = graph_accessor.graw(concepts_i, concepts_t)
+    graph_bonus = graph_accessor.structural_bonus(concepts_i, concepts_t)
+    graw = ki + graph_bonus
     gcomp = max(0.0, graw - ki)
     explicit_match = _clip01(
         EXPLICIT_MATCH_WEIGHTS["K"] * ki
@@ -338,7 +335,13 @@ def _sim_a(left: Dict[str, int], right: Dict[str, int]) -> float:
     return dot / denom
 
 
-def _redundancy(candidate: Dict[str, Any], selected: Sequence[Dict[str, Any]], eqsem_norm: np.ndarray, pid_to_idx: Dict[str, int], catalog: Dict[str, Dict[str, Any]]) -> float:
+def _redundancy(
+    candidate: Dict[str, Any],
+    selected: Sequence[Dict[str, Any]],
+    eqsem_norm: np.ndarray,
+    pid_to_idx: Dict[str, int],
+    catalog: Dict[str, Dict[str, Any]],
+) -> float:
     if not selected:
         return 0.0
     pid_i = candidate["problem_id"]
@@ -358,7 +361,13 @@ def _redundancy(candidate: Dict[str, Any], selected: Sequence[Dict[str, Any]], e
     return best
 
 
-def _coverage_gain(candidate: Dict[str, Any], selected: Sequence[Dict[str, Any]], target_pid: str, graph_accessor: GraphAccessor, catalog: Dict[str, Dict[str, Any]]) -> float:
+def _coverage_gain(
+    candidate: Dict[str, Any],
+    selected: Sequence[Dict[str, Any]],
+    target_pid: str,
+    graph_accessor: GraphAccessor,
+    catalog: Dict[str, Dict[str, Any]],
+) -> float:
     target_concepts = catalog[target_pid]["concepts"]
     target_neighbor_set = set(graph_accessor.problem_neighbors(target_pid))
     covered_roles = {role: 0 for role in ROLE_ORDER}
@@ -401,9 +410,7 @@ def _summary_fields(
     sdyn: float,
 ) -> Dict[str, Any]:
     target_concepts = catalog[target_pid]["concepts"]
-    freq: Dict[str, int] = {}
-    for concept in target_concepts:
-        freq[concept] = 0
+    freq: Dict[str, int] = {concept: 0 for concept in target_concepts}
     for candidate in selected:
         for concept in candidate["knowledge_overlap_concepts"]:
             if concept in freq:
@@ -413,7 +420,8 @@ def _summary_fields(
 
     total_ui = sum(float(candidate["Ui"]) for candidate in selected)
     r_e = (
-        sum(float(candidate["Ui"]) * (1.0 if candidate["answer_result"] == "正确" else 0.0) for candidate in selected) / float(total_ui + EPS)
+        sum(float(candidate["Ui"]) * (1.0 if candidate["answer_result"] == "正确" else 0.0) for candidate in selected)
+        / float(total_ui + EPS)
         if selected
         else 0.0
     )
@@ -424,6 +432,7 @@ def _summary_fields(
         recent_trend = "近期表现波动"
     else:
         recent_trend = "近期表现偏弱"
+
     zrisk = 1.0 - ztrend
     if zrisk < 0.33:
         risk_level = "低"
@@ -431,8 +440,8 @@ def _summary_fields(
         risk_level = "中"
     else:
         risk_level = "高"
-    dominant_role = _dominant_role(selected)
 
+    dominant_role = _dominant_role(selected)
     target_concepts_text = "、".join(target_concepts_out) if target_concepts_out else "无"
     summary_text = SUMMARY_TEMPLATE.format(
         target_concepts=target_concepts_text,
@@ -500,7 +509,6 @@ def run_stage34(
     ensure_dir(reports_dir)
     ensure_dir(cache_dir)
 
-    manifest = json.loads((priors_dir / "stage32_manifest.json").read_text(encoding="utf-8"))
     problem_records = load_problem_records(problem_json)
     student_sequences = load_student_sequences(student_json)
 
@@ -547,10 +555,15 @@ def run_stage34(
         for student in tqdm(student_sequences, desc="strict contexts"):
             seq_pids = [str(log.get("problem_id") or "") for log in student.seq if str(log.get("problem_id") or "") in pid_to_idx]
             seq_results = [int(log.get("is_correct") or 0) for log in student.seq if str(log.get("problem_id") or "") in pid_to_idx]
-            seq_levels = [int(problem_catalog_records[str(log.get("problem_id"))]["cognitive_dimension"]) for log in student.seq if str(log.get("problem_id") or "") in pid_to_idx]
+            seq_levels = [
+                int(problem_catalog_records[str(log.get("problem_id"))]["cognitive_dimension"])
+                for log in student.seq
+                if str(log.get("problem_id") or "") in pid_to_idx
+            ]
             seq_problem_indices = [pid_to_idx[pid] for pid in seq_pids]
             if len(seq_problem_indices) < 2:
                 continue
+
             for target_t in range(1, len(seq_problem_indices)):
                 target_pid = pid_lookup[seq_problem_indices[target_t]]
                 _z, d_vec, sdyn = _compute_dynamic_prior(
@@ -592,6 +605,7 @@ def run_stage34(
                     first = remaining.pop(0)
                     first["support_score"] = float(first["Ui"])
                     selected.append(first)
+
                 while remaining and len(selected) < K2_DEFAULT:
                     best_item = None
                     best_key = None
@@ -611,9 +625,7 @@ def run_stage34(
                 evidence_list = [_evidence_record(candidate, rank, problem_catalog_records) for rank, candidate in enumerate(selected, start=1)]
                 summary_fields = _summary_fields(target_pid, selected, problem_catalog_records, sdyn)
                 main_context_text = "\n".join(evidence["text"] for evidence in evidence_list).strip()
-                template_context_text = (
-                    summary_fields["summary_text"] + ("\n" + main_context_text if main_context_text else "")
-                ).strip()
+                template_context_text = (summary_fields["summary_text"] + ("\n" + main_context_text if main_context_text else "")).strip()
 
                 record = {
                     "user_id": student.user_id,
@@ -647,7 +659,10 @@ def run_stage34(
     embeddings_path: Optional[Path] = None
     if not dry_run:
         local_model_path = resolve_local_sentence_transformer_path(BGE_MODEL_NAME)
-        encoder = SentenceTransformer(str(local_model_path) if local_model_path else BGE_MODEL_NAME, local_files_only=bool(local_model_path))
+        encoder = SentenceTransformer(
+            str(local_model_path) if local_model_path else BGE_MODEL_NAME,
+            local_files_only=bool(local_model_path),
+        )
         main_texts: List[str] = []
         template_texts: List[str] = []
         with contexts_path.open("r", encoding="utf-8") as f:

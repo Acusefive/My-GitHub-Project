@@ -159,7 +159,9 @@ class ConceptGraphScorer:
         self.max_path_len = int(max_path_len)
 
         self.adj: Dict[str, List[Tuple[str, float]]] = defaultdict(list)  # src -> list(dst, omega_rel)
+        self.undirected_adj: Dict[str, List[str]] = defaultdict(list)
         self._phi_cache: Dict[str, Dict[str, float]] = {}
+        self._neighborhood_cache: Dict[Tuple[str, ...], List[str]] = {}
 
         self._load_edges()
 
@@ -188,6 +190,8 @@ class ConceptGraphScorer:
                 if omega <= 0:
                     continue
                 self.adj[src].append((dst, omega))
+                self.undirected_adj[src].append(dst)
+                self.undirected_adj[dst].append(src)
 
     def phi_map_from_src(self, src: str) -> Dict[str, float]:
         if src in self._phi_cache:
@@ -246,6 +250,52 @@ class ConceptGraphScorer:
                 if v > best:
                     best = v
         return float(best)
+
+    def neighborhood(self, concepts: Sequence[str]) -> List[str]:
+        seeds = tuple(sorted({str(c) for c in concepts if c}))
+        if not seeds:
+            return []
+        if seeds in self._neighborhood_cache:
+            return self._neighborhood_cache[seeds]
+
+        visited = set(seeds)
+        q: List[Tuple[str, int]] = [(c, 0) for c in seeds]
+        qi = 0
+        while qi < len(q):
+            node, depth = q[qi]
+            qi += 1
+            if depth >= self.max_path_len:
+                continue
+            for nxt in self.undirected_adj.get(node, []):
+                if nxt in visited:
+                    continue
+                visited.add(nxt)
+                q.append((nxt, depth + 1))
+
+        ordered = sorted(visited)
+        self._neighborhood_cache[seeds] = ordered
+        return ordered
+
+    def coverage_nodes(self, concepts_i: Sequence[str], concepts_t: Sequence[str]) -> List[str]:
+        if not concepts_i or not concepts_t:
+            return []
+
+        target_neigh = set(self.neighborhood(concepts_t))
+        target_neigh.update(str(c) for c in concepts_t if c)
+        covered: set[str] = set()
+
+        for a in concepts_i:
+            a = str(a)
+            if not a:
+                continue
+            if a in target_neigh:
+                covered.add(a)
+            phi = self.phi_map_from_src(a)
+            for b in target_neigh:
+                if phi.get(b, 0.0) > 0:
+                    covered.add(b)
+
+        return sorted(covered)
 
 
 def jaccard(a: Sequence[str], b: Sequence[str]) -> float:
@@ -505,7 +555,6 @@ def main() -> None:
         evidence_lines = []
         for pid in evidence_pids:
             sem_id = semantic_ids.get(pid, "Unknown")
-            # evidence 的 r 严格由 recent_correct_seq 不一定包含，这里只用语义ID
             evidence_lines.append(f"{sem_id}")
         prompt = (
             "你是知识追踪助手。请根据最近作答与检索证据，输出 1-2 句中文摘要，"
@@ -562,11 +611,11 @@ def main() -> None:
         target_t: int,
         student_uid: str,
         mastery: Sequence[float],
-    ) -> Tuple[List[int], List[str]]:
+    ) -> Tuple[List[int], List[Dict[str, Any]]]:
         """
         返回：
           - selected evidence indices (history indices in [0..target_t-1]) length K
-          - evidence pids in the chosen order
+          - selected evidence info in the final order
         """
         qt_log = seq[target_t]
         qt_pid = str(qt_log.get("problem_id", ""))
@@ -785,6 +834,8 @@ def main() -> None:
         # coverage increments
         Kt = pid2meta[qt_pid]["concepts"]
         Kt_set = set(Kt)
+        target_graph_nodes = set(graph_scorer.neighborhood(Kt))
+        target_graph_nodes.update(Kt_set)
 
         chosen: List[int] = []
         # initialize with max U
@@ -795,6 +846,13 @@ def main() -> None:
 
         # maintain union concepts for Δ_k
         union_concepts = set(pid2meta[str(seq[best_i].get("problem_id", ""))]["concepts"])
+        union_graph_nodes = set(
+            graph_scorer.coverage_nodes(
+                pid2meta[str(seq[best_i].get("problem_id", ""))]["concepts"],
+                Kt,
+            )
+        )
+        stage2_scores: Dict[int, float] = {best_i: float(compute_U(best_i))}
 
         def compute_Cov_add(i: int) -> float:
             nonlocal union_concepts
@@ -819,8 +877,10 @@ def main() -> None:
             new_cnt = len(new_union & Kt_set)
             delta_k = (new_cnt - cur_cnt) / float(len(Kt_set) + args.eps)
 
-            # graph coverage: approximate by knowledge coverage (strict graph neighborhood requires KG neighborhood sets)
-            delta_g = delta_k
+            graph_nodes_i = set(graph_scorer.coverage_nodes(concepts_i, Kt))
+            cur_graph_cnt = len(union_graph_nodes & target_graph_nodes)
+            new_graph_cnt = len((union_graph_nodes | graph_nodes_i) & target_graph_nodes)
+            delta_g = (new_graph_cnt - cur_graph_cnt) / float(len(target_graph_nodes) + args.eps)
 
             # weights η_* 这里默认 1.0（与先前默认一致）
             eta_p = 1.0
@@ -854,11 +914,42 @@ def main() -> None:
             cand_rem.remove(best_candidate)
             hi_pid = str(seq[best_candidate].get("problem_id", ""))
             union_concepts |= set(pid2meta[hi_pid]["concepts"])
+            union_graph_nodes |= set(graph_scorer.coverage_nodes(pid2meta[hi_pid]["concepts"], Kt))
+            stage2_scores[best_candidate] = float(best_score)
 
-        # chosen order: keep time order ascending
-        chosen_sorted = sorted(chosen)
-        evidence_pids = [str(seq[i].get("problem_id", "")) for i in chosen_sorted]
-        return chosen_sorted, evidence_pids
+        def support_tags_for(i: int) -> List[str]:
+            dat = cand_data[i]
+            tags: List[str] = []
+            if dat["Sp"] > 0:
+                tags.append("前置支撑")
+            if dat["Sm"] > 0:
+                tags.append("同质迁移")
+            if dat["Sh"] > 0:
+                tags.append("高阶佐证")
+            if dat["Sg"] > 0:
+                tags.append("图谱扩展")
+            if dat["lambda"] * dat["Scf"] > 0.15:
+                tags.append("协同补充")
+            if not tags:
+                tags.append("弱匹配")
+            return tags
+
+        selected_infos: List[Dict[str, Any]] = []
+        for rank, i in enumerate(chosen, start=1):
+            pid = str(seq[i].get("problem_id", ""))
+            selected_infos.append(
+                {
+                    "idx": int(i),
+                    "pid": pid,
+                    "stage2_rank": rank,
+                    "stage2_score": float(stage2_scores.get(i, compute_U(i))),
+                    "support_tags": support_tags_for(i),
+                    "graph_nodes": graph_scorer.coverage_nodes(pid2meta[pid]["concepts"], Kt)[:5],
+                    "result": "正确" if int(seq[i].get("is_correct", 0)) == 1 else "错误",
+                    "time_index": int(i),
+                }
+            )
+        return chosen, selected_infos
 
     # Iterate students and build flat texts
     flat_texts: List[str] = []
@@ -894,15 +985,16 @@ def main() -> None:
                 flat_texts.append("")
                 continue
 
-            chosen_idx, evidence_pids = retrieve_for_target(seq, t, uid, mastery)
-            if not evidence_pids:
+            chosen_idx, evidence_infos = retrieve_for_target(seq, t, uid, mastery)
+            if not evidence_infos:
                 flat_texts.append("")
                 continue
 
             target_pid = str(seq[t].get("problem_id", ""))
             evidence_blocks: List[str] = []
-            for k, i in enumerate(chosen_idx):
-                h_pid = str(seq[i].get("problem_id", ""))
+            for k, info in enumerate(evidence_infos):
+                i = int(info["idx"])
+                h_pid = str(info["pid"])
                 sem_id = semantic_ids.get(h_pid, "Unknown")
                 collab_nei = collab_neighbors.get(h_pid, [])[:3]
                 collab_sem_ids = [semantic_ids.get(x, "Unknown") for x in collab_nei]
@@ -912,10 +1004,15 @@ def main() -> None:
                 content_str = (content_str[: int(args.max_content_chars)] if content_str else "无可用内容").replace("\n", " ")
                 r_i = int(seq[i].get("is_correct", 0))
                 perf = "正确" if r_i == 1 else "错误"
+                support_str = " / ".join(info.get("support_tags", []))
+                graph_support = "、".join(info.get("graph_nodes", [])) if info.get("graph_nodes") else "无"
 
                 evidence_blocks.append(
                     f"[EVIDENCE {k+1}]\n"
                     f"Question ID: {sem_id}\n"
+                    f"Primary Rank: {int(info.get('stage2_rank', k + 1))}\n"
+                    f"Support: {support_str}\n"
+                    f"Structural: {graph_support}\n"
                     f"Collaborative: {collab_str}\n"
                     f"Cognitive: Level={lvl}\n"
                     f"Content: {content_str}\n"
@@ -929,6 +1026,7 @@ def main() -> None:
                 pid = str(log.get("problem_id", ""))
                 rc = int(log.get("is_correct", 0))
                 recent_recent_seq.append((pid, rc))
+            evidence_pids = [str(info["pid"]) for info in evidence_infos]
             D_u_t = get_summary_with_cache(
                 uid=uid,
                 evidence_pids=evidence_pids,

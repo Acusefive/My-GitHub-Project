@@ -47,6 +47,7 @@ from .io_utils import (
     format_float,
     load_problem_records,
     load_student_sequences,
+    pick_device,
     resolve_local_sentence_transformer_path,
     write_json,
 )
@@ -151,6 +152,81 @@ def _dtc(
     return value
 
 
+def _dtc_values(
+    seq_problem_indices: Sequence[int],
+    current_t: int,
+    eq_cos_matrix: np.ndarray,
+) -> np.ndarray:
+    if current_t <= 0:
+        return np.zeros((0,), dtype=np.float32)
+    one_minus = 1.0 - np.clip(eq_cos_matrix[:current_t, current_t], -1.0, 1.0)
+    suffix = np.cumsum(one_minus[::-1], dtype=np.float32)[::-1]
+    shifted = np.concatenate([suffix[1:], np.zeros((1,), dtype=np.float32)], axis=0)
+    return (1.0 + shifted).astype(np.float32)
+
+
+def _build_sequence_cache(
+    seq_problem_indices: Sequence[int],
+    seq_levels: Sequence[int],
+    pid_lookup: Sequence[str],
+    eqsem_norm: np.ndarray,
+    collab_norm: Dict[int, np.ndarray],
+    graph_accessor: GraphAccessor,
+    problem_catalog: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    seq_indices = np.asarray(seq_problem_indices, dtype=np.int64)
+    seq_levels_arr = np.asarray(seq_levels, dtype=np.int32)
+    seq_pids = [pid_lookup[int(idx)] for idx in seq_indices.tolist()]
+    seq_concepts = [problem_catalog[pid]["concepts"] for pid in seq_pids]
+    seq_concept_sets = [set(concepts) for concepts in seq_concepts]
+    seq_neighbors = [set(graph_accessor.problem_neighbors(pid)) for pid in seq_pids]
+
+    seq_eq_norm = eqsem_norm[seq_indices]
+    eq_cos = np.clip(seq_eq_norm @ seq_eq_norm.T, -1.0, 1.0).astype(np.float32)
+
+    collab_cos = np.zeros((len(seq_indices), len(seq_indices)), dtype=np.float32)
+    available_rows: List[int] = []
+    collab_rows: List[np.ndarray] = []
+    for pos, global_idx in enumerate(seq_indices.tolist()):
+        vector = collab_norm.get(int(global_idx))
+        if vector is None:
+            continue
+        available_rows.append(pos)
+        collab_rows.append(vector)
+    if collab_rows:
+        collab_matrix = np.stack(collab_rows, axis=0).astype(np.float32)
+        collab_pairwise = np.clip(collab_matrix @ collab_matrix.T, -1.0, 1.0).astype(np.float32)
+        for left_pos, row_pos in enumerate(available_rows):
+            collab_cos[row_pos, available_rows] = collab_pairwise[left_pos]
+
+    jaccard = np.zeros((len(seq_indices), len(seq_indices)), dtype=np.float32)
+    graph_bonus = np.zeros((len(seq_indices), len(seq_indices)), dtype=np.float32)
+    overlap_lists: List[List[List[str]]] = [[[] for _ in range(len(seq_indices))] for _ in range(len(seq_indices))]
+    for hist_pos in range(len(seq_indices)):
+        left_set = seq_concept_sets[hist_pos]
+        left_concepts = seq_concepts[hist_pos]
+        for target_t in range(hist_pos + 1, len(seq_indices)):
+            right_set = seq_concept_sets[target_t]
+            inter = sorted(left_set & right_set)
+            union_size = len(left_set | right_set)
+            jaccard_value = float(len(inter)) / float(union_size) if union_size > 0 else 0.0
+            jaccard[hist_pos, target_t] = jaccard_value
+            overlap_lists[hist_pos][target_t] = inter
+            graph_bonus[hist_pos, target_t] = graph_accessor.structural_bonus(left_concepts, seq_concepts[target_t])
+
+    return {
+        "seq_indices": seq_indices,
+        "seq_levels": seq_levels_arr,
+        "seq_pids": seq_pids,
+        "seq_neighbors": seq_neighbors,
+        "eq_cos": eq_cos,
+        "collab_cos": collab_cos,
+        "jaccard": jaccard,
+        "graph_bonus": graph_bonus,
+        "overlap_lists": overlap_lists,
+    }
+
+
 def _compute_dynamic_prior(
     seq_problem_indices: Sequence[int],
     seq_results: Sequence[int],
@@ -159,6 +235,7 @@ def _compute_dynamic_prior(
     eqsem: np.ndarray,
     eqsem_norm: np.ndarray,
     model: Any,
+    device: str,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     history_start = max(0, target_t - HISTORY_WINDOW)
     hist_positions = list(range(history_start, target_t))
@@ -205,12 +282,28 @@ def _compute_dynamic_prior(
     z = np.sum(alpha.reshape(-1, 1) * np.stack(x_rows, axis=0), axis=0).astype(np.float32)
 
     with torch.no_grad():
-        z_t = torch.tensor(z, dtype=torch.float32).unsqueeze(0)
+        z_t = torch.tensor(z, dtype=torch.float32, device=device).unsqueeze(0)
         d_tensor = model.dynamic(z_t).squeeze(0).to(torch.float32)
-        qt_tensor = torch.tensor(qt_vec, dtype=torch.float32).unsqueeze(0)
+        qt_tensor = torch.tensor(qt_vec, dtype=torch.float32, device=device).unsqueeze(0)
         sdyn = torch.sigmoid(model.diag_logits(qt_tensor, d_tensor.unsqueeze(0))).cpu().item()
         d_vec = np.asarray(d_tensor.cpu().tolist(), dtype=np.float32)
     return z, d_vec, float(sdyn)
+
+
+def _history_diag_probs(
+    hist_problem_indices: Sequence[int],
+    eqsem: np.ndarray,
+    d_vec: np.ndarray,
+    model: Any,
+    device: str,
+) -> np.ndarray:
+    if not hist_problem_indices:
+        return np.zeros((0,), dtype=np.float32)
+    eq_batch = torch.tensor(eqsem[list(hist_problem_indices)], dtype=torch.float32, device=device)
+    d_batch = torch.tensor(np.repeat(d_vec[None, :], len(hist_problem_indices), axis=0), dtype=torch.float32, device=device)
+    with torch.no_grad():
+        probs = torch.sigmoid(model.diag_logits(eq_batch, d_batch)).detach().cpu().numpy()
+    return np.asarray(probs, dtype=np.float32)
 
 
 def _candidate_scores(
@@ -221,13 +314,11 @@ def _candidate_scores(
     seq_results: Sequence[int],
     seq_levels: Sequence[int],
     eqsem: np.ndarray,
-    eqsem_norm: np.ndarray,
-    collab_norm: Dict[int, np.ndarray],
-    graph_accessor: GraphAccessor,
     problem_catalog: Dict[str, Dict[str, Any]],
     pid_lookup: Sequence[str],
-    d_vec: np.ndarray,
-    model: Any,
+    p_diag: float,
+    dtc_value: float,
+    seq_cache: Dict[str, Any],
 ) -> Dict[str, Any]:
     pid_i = pid_lookup[seq_problem_indices[hist_pos]]
     pid_t = pid_lookup[seq_problem_indices[current_t]]
@@ -235,20 +326,12 @@ def _candidate_scores(
     meta_t = problem_catalog[pid_t]
     concepts_i = meta_i["concepts"]
     concepts_t = meta_t["concepts"]
-    ki = _jaccard(concepts_i, concepts_t)
+    ki = float(seq_cache["jaccard"][hist_pos, current_t])
     delta_l = int(meta_t["cognitive_dimension"]) - int(meta_i["cognitive_dimension"])
 
     eq_i = eqsem[seq_problem_indices[hist_pos]]
-    eq_i_norm = eqsem_norm[seq_problem_indices[hist_pos]]
-    eq_t_norm = eqsem_norm[seq_problem_indices[current_t]]
+    seq_eq_cos = seq_cache["eq_cos"]
 
-    with torch.no_grad():
-        p_diag = torch.sigmoid(
-            model.diag_logits(
-                torch.tensor(eq_i, dtype=torch.float32).unsqueeze(0),
-                torch.tensor(d_vec, dtype=torch.float32).unsqueeze(0),
-            )
-        ).cpu().item()
     mi = RHO * float(seq_results[hist_pos]) + (1.0 - RHO) * float(p_diag)
 
     spre = 0.0
@@ -257,13 +340,13 @@ def _candidate_scores(
     if delta_l > 0:
         spre = ki * mi * math.exp(-GAMMA_PRE * abs(delta_l))
     elif delta_l == 0:
-        speer = _scaled_cosine(eq_i_norm, eq_t_norm)
+        speer = float(seq_eq_cos[hist_pos, current_t])
     else:
         shigh = ki * ((BETA_POS * float(seq_results[hist_pos])) - (BETA_NEG * (1.0 - float(seq_results[hist_pos])))) * math.exp(
             -GAMMA_HIGH * abs(delta_l)
         )
 
-    graph_bonus = graph_accessor.structural_bonus(concepts_i, concepts_t)
+    graph_bonus = float(seq_cache["graph_bonus"][hist_pos, current_t])
     graw = ki + graph_bonus
     gcomp = max(0.0, graw - ki)
     explicit_match = _clip01(
@@ -271,12 +354,9 @@ def _candidate_scores(
         + EXPLICIT_MATCH_WEIGHTS["L"] * math.exp(-1.0 * abs(delta_l))
         + EXPLICIT_MATCH_WEIGHTS["G"] * gcomp
     )
-    collab_vec_i = collab_norm.get(seq_problem_indices[hist_pos])
-    collab_vec_t = collab_norm.get(seq_problem_indices[current_t])
-    collab_sim = _scaled_cosine(collab_vec_i, collab_vec_t) if collab_vec_i is not None and collab_vec_t is not None else 0.0
+    collab_sim = float(seq_cache["collab_cos"][hist_pos, current_t])
     scollab = (1.0 - explicit_match) * collab_sim
 
-    dtc_value = _dtc(seq_problem_indices, current_t, hist_pos, eqsem_norm)
     ti = math.exp(-ALPHA_TIME * dtc_value)
 
     bi = (
@@ -307,7 +387,7 @@ def _candidate_scores(
     return {
         "history_pos": hist_pos,
         "problem_id": pid_i,
-        "knowledge_overlap_concepts": sorted(set(concepts_i) & set(concepts_t)),
+        "knowledge_overlap_concepts": list(seq_cache["overlap_lists"][hist_pos][current_t]),
         "raw_scores": {
             "pre": float(spre),
             "peer": float(speer),
@@ -531,7 +611,8 @@ def run_stage34(
         collab_map = pickle.load(f)
     graph_bundle = json.loads((priors_dir / "concept_graph_bundle.json").read_text(encoding="utf-8"))
     graph_accessor = GraphAccessor(graph_bundle)
-    model = load_strict_prior_model(str(priors_dir / "model_state.pt"))
+    device = pick_device()
+    model = load_strict_prior_model(str(priors_dir / "model_state.pt"), map_location=device).to(device)
     model.eval()
 
     pid_lookup = list(problem_catalog_records.keys())
@@ -563,6 +644,15 @@ def run_stage34(
             seq_problem_indices = [pid_to_idx[pid] for pid in seq_pids]
             if len(seq_problem_indices) < 2:
                 continue
+            seq_cache = _build_sequence_cache(
+                seq_problem_indices,
+                seq_levels,
+                pid_lookup,
+                eqsem_norm,
+                collab_norm,
+                graph_accessor,
+                problem_catalog_records,
+            )
 
             for target_t in range(1, len(seq_problem_indices)):
                 target_pid = pid_lookup[seq_problem_indices[target_t]]
@@ -574,7 +664,11 @@ def run_stage34(
                     eqsem,
                     eqsem_norm,
                     model,
+                    device,
                 )
+                hist_problem_indices = seq_problem_indices[:target_t]
+                hist_diag_probs = _history_diag_probs(hist_problem_indices, eqsem, d_vec, model, device)
+                dtc_values = _dtc_values(seq_problem_indices, target_t, seq_cache["eq_cos"])
 
                 candidates: List[Dict[str, Any]] = []
                 for hist_pos in range(0, target_t):
@@ -585,13 +679,11 @@ def run_stage34(
                         seq_results=seq_results,
                         seq_levels=seq_levels,
                         eqsem=eqsem,
-                        eqsem_norm=eqsem_norm,
-                        collab_norm=collab_norm,
-                        graph_accessor=graph_accessor,
                         problem_catalog=problem_catalog_records,
                         pid_lookup=pid_lookup,
-                        d_vec=d_vec,
-                        model=model,
+                        p_diag=float(hist_diag_probs[hist_pos]),
+                        dtc_value=float(dtc_values[hist_pos]),
+                        seq_cache=seq_cache,
                     )
                     candidates.append(candidate)
 
@@ -662,6 +754,7 @@ def run_stage34(
         encoder = SentenceTransformer(
             str(local_model_path) if local_model_path else BGE_MODEL_NAME,
             local_files_only=bool(local_model_path),
+            device=device,
         )
         main_texts: List[str] = []
         template_texts: List[str] = []

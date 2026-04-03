@@ -277,16 +277,16 @@ def estimate_rasch_mu_q(
 def build_concept_pc1_directions(
     problem_records: Sequence[ProblemRecord],
     eqbase_vectors: np.ndarray,
+    *,
+    concept_groups: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
 ) -> Dict[str, np.ndarray]:
-    concept_to_positions: Dict[str, List[int]] = defaultdict(list)
-    concept_to_levels: Dict[str, List[int]] = defaultdict(list)
-    for pos, problem in enumerate(problem_records):
-        for concept in problem.concepts:
-            concept_to_positions[concept].append(pos)
-            concept_to_levels[concept].append(problem.cognitive_dimension)
+    if concept_groups is None:
+        concept_groups = build_concept_groups(problem_records)
 
     directions: Dict[str, np.ndarray] = {}
-    for concept, positions in tqdm(concept_to_positions.items(), desc="strict concept pc1"):
+    for concept, group in tqdm(concept_groups.items(), desc="strict concept pc1"):
+        positions = group["positions"]
+        concept_levels = group["levels"]
         if len(positions) == 1:
             vec = eqbase_vectors[positions[0]]
             norm = float(np.linalg.norm(vec))
@@ -296,7 +296,7 @@ def build_concept_pc1_directions(
         centered = matrix - torch.mean(matrix, dim=0, keepdim=True)
         _, _, v_h = torch.linalg.svd(centered, full_matrices=False)
         pc1 = v_h[0].to(torch.float32)
-        levels_t = torch.tensor(concept_to_levels[concept], dtype=torch.int64)
+        levels_t = torch.tensor(concept_levels.tolist(), dtype=torch.int64)
         proj = centered @ pc1
         unique_levels = sorted(set(levels_t.tolist()))
         if len(unique_levels) >= 2:
@@ -310,6 +310,22 @@ def build_concept_pc1_directions(
                 pc1 = -pc1
         directions[concept] = np.asarray(pc1.detach().cpu().tolist(), dtype=np.float32)
     return directions
+
+
+def build_concept_groups(problem_records: Sequence[ProblemRecord]) -> Dict[str, Dict[str, np.ndarray]]:
+    concept_to_positions: Dict[str, List[int]] = defaultdict(list)
+    concept_to_levels: Dict[str, List[int]] = defaultdict(list)
+    for pos, problem in enumerate(problem_records):
+        for concept in problem.concepts:
+            concept_to_positions[concept].append(pos)
+            concept_to_levels[concept].append(problem.cognitive_dimension)
+    groups: Dict[str, Dict[str, np.ndarray]] = {}
+    for concept in sorted(concept_to_positions):
+        groups[concept] = {
+            "positions": np.asarray(concept_to_positions[concept], dtype=np.int64),
+            "levels": np.asarray(concept_to_levels[concept], dtype=np.int64),
+        }
+    return groups
 
 
 def build_problem_concept_directions(
@@ -438,9 +454,9 @@ def build_training_sequences(
             cached.append(
                 {
                     "user_id": sequence.user_id,
-                    "problem_indices": pid_indices,
-                    "results": results,
-                    "levels": item_levels,
+                    "problem_indices": np.asarray(pid_indices, dtype=np.int64),
+                    "results": np.asarray(results, dtype=np.int64),
+                    "levels": np.asarray(item_levels, dtype=np.int64),
                 }
             )
     return cached
@@ -480,8 +496,8 @@ def _batch_loss(
     sequence_cache: Sequence[Dict[str, Any]],
     hqtext_tensor: torch.Tensor,
     hqid_tensor: torch.Tensor,
-    problem_dcq: np.ndarray,
-    mu_values: np.ndarray,
+    problem_dcq_tensor: torch.Tensor,
+    mu_values_tensor: torch.Tensor,
     *,
     device: str,
 ) -> torch.Tensor:
@@ -496,11 +512,11 @@ def _batch_loss(
     sorted_unique = sorted(unique_problem_indices)
     local_pos = {pid_idx: pos for pos, pid_idx in enumerate(sorted_unique)}
     eqbase_local = model.eqbase(
-        hqtext_tensor[sorted_unique].to(device),
-        hqid_tensor[sorted_unique].to(device),
+        hqtext_tensor[sorted_unique],
+        hqid_tensor[sorted_unique],
     )
-    dcq_local = torch.tensor(problem_dcq[sorted_unique], dtype=torch.float32, device=device)
-    mu_local = torch.tensor(mu_values[sorted_unique], dtype=torch.float32, device=device).unsqueeze(-1)
+    dcq_local = problem_dcq_tensor[sorted_unique]
+    mu_local = mu_values_tensor[sorted_unique].unsqueeze(-1)
     eqsem_local = eqbase_local + mu_local * dcq_local
 
     z_rows: List[torch.Tensor] = []
@@ -517,37 +533,35 @@ def _batch_loss(
         hist_problem_indices = sequence["problem_indices"][history_start:t]
         hist_results = sequence["results"][history_start:t]
         hist_levels = sequence["levels"][history_start:t]
-        if not hist_problem_indices:
+        if len(hist_problem_indices) == 0:
             z_rows.append(torch.zeros((260,), dtype=torch.float32, device=device))
             target_eq_rows.append(target_eq)
             labels.append(float(sequence["results"][t]))
             continue
 
-        hist_eq = torch.stack([eqsem_local[local_pos[int(pid_idx)]] for pid_idx in hist_problem_indices], dim=0)
+        hist_local_indices = [local_pos[int(pid_idx)] for pid_idx in hist_problem_indices]
+        hist_eq = eqsem_local[hist_local_indices]
         hist_eq_norm = F.normalize(hist_eq, dim=-1)
         target_eq_norm = F.normalize(target_eq.unsqueeze(0), dim=-1).squeeze(0)
         cos_scores = torch.sum(hist_eq_norm * target_eq_norm.unsqueeze(0), dim=-1)
 
-        history_positions = list(range(history_start, t))
-        score_terms: List[torch.Tensor] = []
-        for pos, cos_score, level in zip(history_positions, cos_scores, hist_levels):
-            lag = t - pos
-            score_terms.append(
-                cos_score
-                - float(LAMBDA_L) * abs(float(level - target_level))
-                - float(LAMBDA_T) * math.log1p(float(lag))
-            )
-        score_tensor = torch.stack(score_terms, dim=0) / float(TAU)
+        hist_levels_tensor = torch.tensor(hist_levels, dtype=torch.float32, device=device)
+        lags_tensor = torch.arange(len(hist_levels), 0, -1, dtype=torch.float32, device=device)
+        score_tensor = (
+            cos_scores
+            - float(LAMBDA_L) * torch.abs(hist_levels_tensor - float(target_level))
+            - float(LAMBDA_T) * torch.log1p(lags_tensor)
+        ) / float(TAU)
         alpha = torch.softmax(score_tensor, dim=0)
 
         result_tensor = torch.tensor(hist_results, dtype=torch.float32, device=device).unsqueeze(-1)
-        relation_features = torch.tensor(
+        relation_features = torch.stack(
             [
-                [1.0 if level < target_level else 0.0, 1.0 if level == target_level else 0.0, 1.0 if level > target_level else 0.0]
-                for level in hist_levels
+                (hist_levels_tensor < float(target_level)).to(torch.float32),
+                (hist_levels_tensor == float(target_level)).to(torch.float32),
+                (hist_levels_tensor > float(target_level)).to(torch.float32),
             ],
-            dtype=torch.float32,
-            device=device,
+            dim=-1,
         )
         x_i = torch.cat([hist_eq, result_tensor, relation_features], dim=-1)
         z = torch.sum(alpha.unsqueeze(-1) * x_i, dim=0)
@@ -572,6 +586,7 @@ def train_strict_model(
     hqtext_vectors: np.ndarray,
     hqid_vectors: np.ndarray,
     mu_values: np.ndarray,
+    concept_groups: Dict[str, Dict[str, np.ndarray]],
     *,
     priors_dir: Path,
     smoke: bool,
@@ -585,21 +600,22 @@ def train_strict_model(
     model = StrictPriorModel().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=TRAIN_LR)
 
-    hqtext_tensor = torch.tensor(hqtext_vectors.astype(np.float32), dtype=torch.float32)
-    hqid_tensor = torch.tensor(hqid_vectors.astype(np.float32), dtype=torch.float32)
+    hqtext_tensor = torch.tensor(hqtext_vectors.astype(np.float32), dtype=torch.float32, device=device)
+    hqid_tensor = torch.tensor(hqid_vectors.astype(np.float32), dtype=torch.float32, device=device)
+    mu_values_tensor = torch.tensor(mu_values.astype(np.float32), dtype=torch.float32, device=device)
 
     def refresh_problem_dcq() -> np.ndarray:
         was_training = model.training
         model.eval()
         with torch.no_grad():
             eqbase_all = model.eqbase(
-                hqtext_tensor.to(device),
-                hqid_tensor.to(device),
+                hqtext_tensor,
+                hqid_tensor,
             ).detach().cpu().tolist()
         if was_training:
             model.train()
         eqbase_all_np = np.asarray(eqbase_all, dtype=np.float32)
-        concept_pc1_dirs = build_concept_pc1_directions(problem_records, eqbase_all_np)
+        concept_pc1_dirs = build_concept_pc1_directions(problem_records, eqbase_all_np, concept_groups=concept_groups)
         return build_problem_concept_directions(problem_records, concept_pc1_dirs)
 
     best_val = float("inf")
@@ -610,6 +626,7 @@ def train_strict_model(
     for epoch in range(1, TRAIN_MAX_EPOCHS + 1):
         model.train()
         problem_dcq_train = refresh_problem_dcq()
+        problem_dcq_train_tensor = torch.tensor(problem_dcq_train, dtype=torch.float32, device=device)
         random.Random(seed + epoch).shuffle(train_samples)
         train_losses: List[float] = []
         for start in tqdm(range(0, len(train_samples), TRAIN_BATCH_SIZE), desc=f"strict train epoch {epoch}"):
@@ -623,8 +640,8 @@ def train_strict_model(
                 sequence_cache,
                 hqtext_tensor,
                 hqid_tensor,
-                problem_dcq_train,
-                mu_values,
+                problem_dcq_train_tensor,
+                mu_values_tensor,
                 device=device,
             )
             loss.backward()
@@ -634,6 +651,7 @@ def train_strict_model(
 
         model.eval()
         problem_dcq_val = refresh_problem_dcq()
+        problem_dcq_val_tensor = torch.tensor(problem_dcq_val, dtype=torch.float32, device=device)
         val_losses: List[float] = []
         with torch.no_grad():
             for start in range(0, len(val_samples), TRAIN_BATCH_SIZE):
@@ -646,8 +664,8 @@ def train_strict_model(
                     sequence_cache,
                     hqtext_tensor,
                     hqid_tensor,
-                    problem_dcq_val,
-                    mu_values,
+                    problem_dcq_val_tensor,
+                    mu_values_tensor,
                     device=device,
                 )
                 val_losses.append(float(loss.detach().cpu().item()))
@@ -719,6 +737,7 @@ def run_stage32(
     local_model_path = resolve_local_sentence_transformer_path(BGE_MODEL_NAME)
     model = SentenceTransformer(str(local_model_path) if local_model_path else BGE_MODEL_NAME, local_files_only=bool(local_model_path))
     raw_texts = [problem.text or problem.title or problem.problem_id for problem in problem_records]
+    concept_groups = build_concept_groups(problem_records)
     hqtext_vectors = model.encode(
         raw_texts,
         batch_size=32,
@@ -752,6 +771,7 @@ def run_stage32(
         hqtext_vectors,
         hqid_vectors,
         mu_values,
+        concept_groups,
         priors_dir=priors_dir,
         smoke=smoke,
         seed=seed,
@@ -763,7 +783,7 @@ def run_stage32(
         eqbase_vectors = model_torch.eqbase(hqtext_tensor, hqid_tensor).detach().cpu().tolist()
         eqbase_vectors = np.asarray(eqbase_vectors, dtype=np.float32)
 
-    concept_pc1_dirs = build_concept_pc1_directions(problem_records, eqbase_vectors)
+    concept_pc1_dirs = build_concept_pc1_directions(problem_records, eqbase_vectors, concept_groups=concept_groups)
     problem_dcq = build_problem_concept_directions(problem_records, concept_pc1_dirs)
     mu_arr = mu_values.reshape(-1, 1)
     eqsem_vectors = eqbase_vectors + mu_arr * problem_dcq

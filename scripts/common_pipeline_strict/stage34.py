@@ -51,6 +51,7 @@ from .io_utils import (
     resolve_local_sentence_transformer_path,
     write_json,
 )
+from .llm_utils import OpenAICompatibleSummarizer, append_summary_cache, load_summary_cache, summary_cache_key
 from .models import load_strict_prior_model
 
 
@@ -539,6 +540,125 @@ def _summary_fields(
     }
 
 
+def _build_llm_context_text(llm_summary_text: str, main_context_text: str) -> str:
+    summary = " ".join(str(llm_summary_text or "").split())
+    main = str(main_context_text or "").strip()
+    if summary and main:
+        return summary + "\n" + main
+    return summary or main
+
+
+def _load_index_records_from_contexts(contexts_path: Path) -> Tuple[List[Dict[str, Any]], int]:
+    index_records: List[Dict[str, Any]] = []
+    record_count = 0
+    with contexts_path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            index_records.append(
+                {
+                    "user_id": record["user_id"],
+                    "target_t": record["target_t"],
+                    "target_pid": record["target_pid"],
+                }
+            )
+            record_count += 1
+    return index_records, record_count
+
+
+def _build_context_embeddings(
+    *,
+    contexts_path: Path,
+    cache_dir: Path,
+    device: str,
+) -> Path:
+    local_model_path = resolve_local_sentence_transformer_path(BGE_MODEL_NAME)
+    encoder = SentenceTransformer(
+        str(local_model_path) if local_model_path else BGE_MODEL_NAME,
+        local_files_only=bool(local_model_path),
+        device=device,
+    )
+    index_records, _record_count = _load_index_records_from_contexts(contexts_path)
+    main_texts: List[str] = []
+    template_texts: List[str] = []
+    llm_texts: List[str] = []
+    with contexts_path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            main_texts.append(record["main_context_text"])
+            template_texts.append(record["template_context_text"])
+            llm_texts.append(record.get("llm_context_text") or "")
+    main_embeddings = encoder.encode(main_texts, batch_size=32, show_progress_bar=True, convert_to_numpy=True)
+    template_embeddings = encoder.encode(template_texts, batch_size=32, show_progress_bar=True, convert_to_numpy=True)
+    llm_embeddings = None
+    if any(text.strip() for text in llm_texts):
+        llm_embeddings = encoder.encode(llm_texts, batch_size=32, show_progress_bar=True, convert_to_numpy=True)
+    main_embeddings = np.asarray(main_embeddings.tolist(), dtype=np.float32)
+    template_embeddings = np.asarray(template_embeddings.tolist(), dtype=np.float32)
+    if llm_embeddings is not None:
+        llm_embeddings = np.asarray(llm_embeddings.tolist(), dtype=np.float32)
+    embeddings_path = cache_dir / "context_embeddings.pkl"
+    with embeddings_path.open("wb") as f:
+        payload = {
+            "index": index_records,
+            "main_embeddings": main_embeddings,
+            "template_embeddings": template_embeddings,
+        }
+        if llm_embeddings is not None:
+            payload["llm_embeddings"] = llm_embeddings
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    return embeddings_path
+
+
+def _enrich_contexts_with_llm_summary(
+    *,
+    contexts_path: Path,
+    cache_dir: Path,
+    problem_catalog_records: Dict[str, Dict[str, Any]],
+    summarizer: OpenAICompatibleSummarizer,
+) -> None:
+    llm_cache_path = cache_dir / "llm_summary_cache.jsonl"
+    llm_cache = load_summary_cache(llm_cache_path)
+    temp_path = contexts_path.with_suffix(".llm.tmp")
+    total_records = 0
+    with contexts_path.open("r", encoding="utf-8", errors="replace") as probe_f:
+        for line in probe_f:
+            if line.strip():
+                total_records += 1
+
+    enriched_count = 0
+    with contexts_path.open("r", encoding="utf-8", errors="replace") as src, temp_path.open("w", encoding="utf-8") as dst:
+        for line in tqdm(src, desc="strict llm summaries", total=total_records):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            key = summary_cache_key(record["user_id"], int(record["target_t"]), record["target_pid"])
+            llm_summary_text = llm_cache.get(key, "").strip()
+            if not llm_summary_text:
+                target_pid = str(record["target_pid"])
+                target_meta = problem_catalog_records[target_pid]
+                llm_summary_text = summarizer.summarize(
+                    target_pid=target_pid,
+                    target_question_text=str(target_meta["text"]),
+                    target_semantic_id=str(record.get("target_semantic_id") or target_meta["semantic_id"]),
+                    target_concepts=record.get("summary_fields", {}).get("target_concepts") or target_meta["concepts"],
+                    evidence_list=record.get("evidence_list") or [],
+                    template_summary_text=str(record.get("summary_fields", {}).get("summary_text") or ""),
+                )
+                llm_cache[key] = llm_summary_text
+                append_summary_cache(llm_cache_path, key, llm_summary_text)
+            record["summary_fields"]["llm_summary_text"] = llm_summary_text
+            record["llm_context_text"] = _build_llm_context_text(llm_summary_text, record.get("main_context_text", ""))
+            dst.write(json.dumps(record, ensure_ascii=False) + "\n")
+            enriched_count += 1
+
+    contexts_path.unlink(missing_ok=True)
+    temp_path.replace(contexts_path)
+
+
 def _evidence_record(candidate: Dict[str, Any], rank: int, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     pid = candidate["problem_id"]
     role_key = _role_from_candidate(candidate)
@@ -584,13 +704,18 @@ def run_stage34(
     preview_limit: int,
     dry_run: bool,
     smoke: bool,
+    enable_llm_summary: bool = False,
+    llm_base_url: Optional[str] = None,
+    llm_model: Optional[str] = None,
+    llm_api_key: Optional[str] = None,
+    llm_timeout_sec: int = 120,
+    llm_max_tokens: int = 160,
+    llm_temperature: float = 0.1,
+    reuse_existing_contexts: bool = False,
 ) -> Stage34Result:
     ensure_dir(contexts_dir)
     ensure_dir(reports_dir)
     ensure_dir(cache_dir)
-
-    problem_records = load_problem_records(problem_json)
-    student_sequences = load_student_sequences(student_json)
 
     problem_catalog_records: Dict[str, Dict[str, Any]] = {}
     with (priors_dir / "problem_catalog.jsonl").open("r", encoding="utf-8") as f:
@@ -600,186 +725,188 @@ def run_stage34(
             record = json.loads(line)
             problem_catalog_records[str(record["problem_id"])] = record
 
-    if smoke:
-        allowed_problem_ids = set(problem_catalog_records.keys())
-        problem_records = [problem for problem in problem_records if problem.problem_id in allowed_problem_ids]
-        student_sequences = student_sequences[:128]
-
-    with (priors_dir / "semantic_vectors.pkl").open("rb") as f:
-        eqsem_map = pickle.load(f)
-    with (priors_dir / "item_collaborative_embeddings.pkl").open("rb") as f:
-        collab_map = pickle.load(f)
-    graph_bundle = json.loads((priors_dir / "concept_graph_bundle.json").read_text(encoding="utf-8"))
-    graph_accessor = GraphAccessor(graph_bundle)
-    device = pick_device()
-    model = load_strict_prior_model(str(priors_dir / "model_state.pt"), map_location=device).to(device)
-    model.eval()
-
-    pid_lookup = list(problem_catalog_records.keys())
-    pid_to_idx = {pid: idx for idx, pid in enumerate(pid_lookup)}
-    eqsem = np.stack([eqsem_map[pid] for pid in pid_lookup], axis=0).astype(np.float32)
-    eqsem_norm = _normalize_matrix(eqsem)
-    collab_norm: Dict[int, np.ndarray] = {}
-    for pid, vector in collab_map.items():
-        if pid in pid_to_idx:
-            value = np.asarray(vector, dtype=np.float32)
-            norm = float(np.linalg.norm(value))
-            collab_norm[pid_to_idx[pid]] = (value / norm).astype(np.float32) if norm > 0 else value
-
     contexts_path = contexts_dir / "contexts.jsonl"
     preview_path = reports_dir / "context_preview.txt"
-    preview_lines: List[str] = []
-    index_records: List[Dict[str, Any]] = []
+    device = pick_device()
+    summarizer: Optional[OpenAICompatibleSummarizer] = None
+    if enable_llm_summary:
+        summarizer = OpenAICompatibleSummarizer(
+            base_url=str(llm_base_url or ""),
+            model=str(llm_model or ""),
+            api_key=llm_api_key,
+            timeout_sec=int(llm_timeout_sec),
+            max_tokens=int(llm_max_tokens),
+            temperature=float(llm_temperature),
+        )
 
-    with contexts_path.open("w", encoding="utf-8") as out_f:
-        record_count = 0
-        for student in tqdm(student_sequences, desc="strict contexts"):
-            seq_pids = [str(log.get("problem_id") or "") for log in student.seq if str(log.get("problem_id") or "") in pid_to_idx]
-            seq_results = [int(log.get("is_correct") or 0) for log in student.seq if str(log.get("problem_id") or "") in pid_to_idx]
-            seq_levels = [
-                int(problem_catalog_records[str(log.get("problem_id"))]["cognitive_dimension"])
-                for log in student.seq
-                if str(log.get("problem_id") or "") in pid_to_idx
-            ]
-            seq_problem_indices = [pid_to_idx[pid] for pid in seq_pids]
-            if len(seq_problem_indices) < 2:
-                continue
-            seq_cache = _build_sequence_cache(
-                seq_problem_indices,
-                seq_levels,
-                pid_lookup,
-                eqsem_norm,
-                collab_norm,
-                graph_accessor,
-                problem_catalog_records,
-            )
+    if reuse_existing_contexts:
+        if not contexts_path.exists():
+            raise FileNotFoundError(f"--reuse_existing_contexts was set but {contexts_path} does not exist")
+        index_records, record_count = _load_index_records_from_contexts(contexts_path)
+    else:
+        problem_records = load_problem_records(problem_json)
+        student_sequences = load_student_sequences(student_json)
 
-            for target_t in range(1, len(seq_problem_indices)):
-                target_pid = pid_lookup[seq_problem_indices[target_t]]
-                _z, d_vec, sdyn = _compute_dynamic_prior(
+        if smoke:
+            allowed_problem_ids = set(problem_catalog_records.keys())
+            problem_records = [problem for problem in problem_records if problem.problem_id in allowed_problem_ids]
+            student_sequences = student_sequences[:128]
+
+        with (priors_dir / "semantic_vectors.pkl").open("rb") as f:
+            eqsem_map = pickle.load(f)
+        with (priors_dir / "item_collaborative_embeddings.pkl").open("rb") as f:
+            collab_map = pickle.load(f)
+        graph_bundle = json.loads((priors_dir / "concept_graph_bundle.json").read_text(encoding="utf-8"))
+        graph_accessor = GraphAccessor(graph_bundle)
+        model = load_strict_prior_model(str(priors_dir / "model_state.pt"), map_location=device).to(device)
+        model.eval()
+
+        pid_lookup = list(problem_catalog_records.keys())
+        pid_to_idx = {pid: idx for idx, pid in enumerate(pid_lookup)}
+        eqsem = np.stack([eqsem_map[pid] for pid in pid_lookup], axis=0).astype(np.float32)
+        eqsem_norm = _normalize_matrix(eqsem)
+        collab_norm: Dict[int, np.ndarray] = {}
+        for pid, vector in collab_map.items():
+            if pid in pid_to_idx:
+                value = np.asarray(vector, dtype=np.float32)
+                norm = float(np.linalg.norm(value))
+                collab_norm[pid_to_idx[pid]] = (value / norm).astype(np.float32) if norm > 0 else value
+
+        preview_lines: List[str] = []
+        index_records = []
+        with contexts_path.open("w", encoding="utf-8") as out_f:
+            record_count = 0
+            for student in tqdm(student_sequences, desc="strict contexts"):
+                seq_pids = [str(log.get("problem_id") or "") for log in student.seq if str(log.get("problem_id") or "") in pid_to_idx]
+                seq_results = [int(log.get("is_correct") or 0) for log in student.seq if str(log.get("problem_id") or "") in pid_to_idx]
+                seq_levels = [
+                    int(problem_catalog_records[str(log.get("problem_id"))]["cognitive_dimension"])
+                    for log in student.seq
+                    if str(log.get("problem_id") or "") in pid_to_idx
+                ]
+                seq_problem_indices = [pid_to_idx[pid] for pid in seq_pids]
+                if len(seq_problem_indices) < 2:
+                    continue
+                seq_cache = _build_sequence_cache(
                     seq_problem_indices,
-                    seq_results,
                     seq_levels,
-                    target_t,
-                    eqsem,
+                    pid_lookup,
                     eqsem_norm,
-                    model,
-                    device,
+                    collab_norm,
+                    graph_accessor,
+                    problem_catalog_records,
                 )
-                hist_problem_indices = seq_problem_indices[:target_t]
-                hist_diag_probs = _history_diag_probs(hist_problem_indices, eqsem, d_vec, model, device)
-                dtc_values = _dtc_values(seq_problem_indices, target_t, seq_cache["eq_cos"])
 
-                candidates: List[Dict[str, Any]] = []
-                for hist_pos in range(0, target_t):
-                    candidate = _candidate_scores(
-                        hist_pos=hist_pos,
-                        current_t=target_t,
-                        seq_problem_indices=seq_problem_indices,
-                        seq_results=seq_results,
-                        seq_levels=seq_levels,
-                        eqsem=eqsem,
-                        problem_catalog=problem_catalog_records,
-                        pid_lookup=pid_lookup,
-                        p_diag=float(hist_diag_probs[hist_pos]),
-                        dtc_value=float(dtc_values[hist_pos]),
-                        seq_cache=seq_cache,
+                for target_t in range(1, len(seq_problem_indices)):
+                    target_pid = pid_lookup[seq_problem_indices[target_t]]
+                    _z, d_vec, sdyn = _compute_dynamic_prior(
+                        seq_problem_indices,
+                        seq_results,
+                        seq_levels,
+                        target_t,
+                        eqsem,
+                        eqsem_norm,
+                        model,
+                        device,
                     )
-                    candidates.append(candidate)
+                    hist_problem_indices = seq_problem_indices[:target_t]
+                    hist_diag_probs = _history_diag_probs(hist_problem_indices, eqsem, d_vec, model, device)
+                    dtc_values = _dtc_values(seq_problem_indices, target_t, seq_cache["eq_cos"])
 
-                candidates.sort(key=lambda item: (item["Ri"], item["history_pos"]), reverse=True)
-                stage1_candidates = candidates[: min(K1_DEFAULT, len(candidates))]
+                    candidates: List[Dict[str, Any]] = []
+                    for hist_pos in range(0, target_t):
+                        candidate = _candidate_scores(
+                            hist_pos=hist_pos,
+                            current_t=target_t,
+                            seq_problem_indices=seq_problem_indices,
+                            seq_results=seq_results,
+                            seq_levels=seq_levels,
+                            eqsem=eqsem,
+                            problem_catalog=problem_catalog_records,
+                            pid_lookup=pid_lookup,
+                            p_diag=float(hist_diag_probs[hist_pos]),
+                            dtc_value=float(dtc_values[hist_pos]),
+                            seq_cache=seq_cache,
+                        )
+                        candidates.append(candidate)
 
-                selected: List[Dict[str, Any]] = []
-                remaining = list(stage1_candidates)
-                if remaining:
-                    remaining.sort(key=lambda item: (item["Ui"], item["history_pos"]), reverse=True)
-                    first = remaining.pop(0)
-                    first["support_score"] = float(first["Ui"])
-                    selected.append(first)
+                    candidates.sort(key=lambda item: (item["Ri"], item["history_pos"]), reverse=True)
+                    stage1_candidates = candidates[: min(K1_DEFAULT, len(candidates))]
 
-                while remaining and len(selected) < K2_DEFAULT:
-                    best_item = None
-                    best_key = None
-                    for candidate in remaining:
-                        cov_gain = _coverage_gain(candidate, selected, target_pid, graph_accessor, problem_catalog_records)
-                        red = _redundancy(candidate, selected, eqsem_norm, pid_to_idx, problem_catalog_records)
-                        f_score = float(candidate["Ui"]) + LAMBDA_COV * cov_gain - LAMBDA_RED * red
-                        sort_key = (f_score, candidate["Ui"], candidate["history_pos"])
-                        if best_key is None or sort_key > best_key:
-                            best_key = sort_key
-                            best_item = candidate
-                            best_item["support_score"] = float(f_score)
-                    assert best_item is not None
-                    selected.append(best_item)
-                    remaining.remove(best_item)
+                    selected: List[Dict[str, Any]] = []
+                    remaining = list(stage1_candidates)
+                    if remaining:
+                        remaining.sort(key=lambda item: (item["Ui"], item["history_pos"]), reverse=True)
+                        first = remaining.pop(0)
+                        first["support_score"] = float(first["Ui"])
+                        selected.append(first)
 
-                evidence_list = [_evidence_record(candidate, rank, problem_catalog_records) for rank, candidate in enumerate(selected, start=1)]
-                summary_fields = _summary_fields(target_pid, selected, problem_catalog_records, sdyn)
-                main_context_text = "\n".join(evidence["text"] for evidence in evidence_list).strip()
-                template_context_text = (summary_fields["summary_text"] + ("\n" + main_context_text if main_context_text else "")).strip()
+                    while remaining and len(selected) < K2_DEFAULT:
+                        best_item = None
+                        best_key = None
+                        for candidate in remaining:
+                            cov_gain = _coverage_gain(candidate, selected, target_pid, graph_accessor, problem_catalog_records)
+                            red = _redundancy(candidate, selected, eqsem_norm, pid_to_idx, problem_catalog_records)
+                            f_score = float(candidate["Ui"]) + LAMBDA_COV * cov_gain - LAMBDA_RED * red
+                            sort_key = (f_score, candidate["Ui"], candidate["history_pos"])
+                            if best_key is None or sort_key > best_key:
+                                best_key = sort_key
+                                best_item = candidate
+                                best_item["support_score"] = float(f_score)
+                        assert best_item is not None
+                        selected.append(best_item)
+                        remaining.remove(best_item)
 
-                record = {
-                    "user_id": student.user_id,
-                    "target_t": target_t,
-                    "target_pid": target_pid,
-                    "target_semantic_id": problem_catalog_records[target_pid]["semantic_id"],
-                    "stage1_candidate_count": len(stage1_candidates),
-                    "selected_count": len(evidence_list),
-                    "main_context_text": main_context_text,
-                    "template_context_text": template_context_text,
-                    "summary_fields": summary_fields,
-                    "evidence_list": evidence_list,
-                }
-                out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                index_records.append(
-                    {
+                    evidence_list = [_evidence_record(candidate, rank, problem_catalog_records) for rank, candidate in enumerate(selected, start=1)]
+                    summary_fields = _summary_fields(target_pid, selected, problem_catalog_records, sdyn)
+                    main_context_text = "\n".join(evidence["text"] for evidence in evidence_list).strip()
+                    template_context_text = (summary_fields["summary_text"] + ("\n" + main_context_text if main_context_text else "")).strip()
+
+                    record = {
                         "user_id": student.user_id,
                         "target_t": target_t,
                         "target_pid": target_pid,
+                        "target_semantic_id": problem_catalog_records[target_pid]["semantic_id"],
+                        "stage1_candidate_count": len(stage1_candidates),
+                        "selected_count": len(evidence_list),
+                        "main_context_text": main_context_text,
+                        "template_context_text": template_context_text,
+                        "llm_context_text": "",
+                        "summary_fields": summary_fields,
+                        "evidence_list": evidence_list,
                     }
-                )
-                if len(preview_lines) < preview_limit:
-                    preview_lines.append(
-                        f"--- {student.user_id} @ t={target_t} / {target_pid} ---\n"
-                        f"[MAIN]\n{main_context_text}\n\n[TEMPLATE]\n{template_context_text}\n"
+                    out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    index_records.append(
+                        {
+                            "user_id": student.user_id,
+                            "target_t": target_t,
+                            "target_pid": target_pid,
+                        }
                     )
-                record_count += 1
+                    if len(preview_lines) < preview_limit:
+                        preview_lines.append(
+                            f"--- {student.user_id} @ t={target_t} / {target_pid} ---\n"
+                            f"[MAIN]\n{main_context_text}\n\n[TEMPLATE]\n{template_context_text}\n"
+                        )
+                    record_count += 1
 
-    atomic_save_text("\n\n".join(preview_lines), preview_path)
+        atomic_save_text("\n\n".join(preview_lines), preview_path)
+
+    if summarizer is not None:
+        _enrich_contexts_with_llm_summary(
+            contexts_path=contexts_path,
+            cache_dir=cache_dir,
+            problem_catalog_records=problem_catalog_records,
+            summarizer=summarizer,
+        )
 
     embeddings_path: Optional[Path] = None
     if not dry_run:
-        local_model_path = resolve_local_sentence_transformer_path(BGE_MODEL_NAME)
-        encoder = SentenceTransformer(
-            str(local_model_path) if local_model_path else BGE_MODEL_NAME,
-            local_files_only=bool(local_model_path),
+        embeddings_path = _build_context_embeddings(
+            contexts_path=contexts_path,
+            cache_dir=cache_dir,
             device=device,
         )
-        main_texts: List[str] = []
-        template_texts: List[str] = []
-        with contexts_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                record = json.loads(line)
-                main_texts.append(record["main_context_text"])
-                template_texts.append(record["template_context_text"])
-        main_embeddings = encoder.encode(main_texts, batch_size=32, show_progress_bar=True, convert_to_numpy=True)
-        template_embeddings = encoder.encode(template_texts, batch_size=32, show_progress_bar=True, convert_to_numpy=True)
-        main_embeddings = np.asarray(main_embeddings.tolist(), dtype=np.float32)
-        template_embeddings = np.asarray(template_embeddings.tolist(), dtype=np.float32)
-        embeddings_path = cache_dir / "context_embeddings.pkl"
-        with embeddings_path.open("wb") as f:
-            pickle.dump(
-                {
-                    "index": index_records,
-                    "main_embeddings": main_embeddings,
-                    "template_embeddings": template_embeddings,
-                },
-                f,
-                protocol=pickle.HIGHEST_PROTOCOL,
-            )
 
     result = Stage34Result(
         contexts_path=str(contexts_path),

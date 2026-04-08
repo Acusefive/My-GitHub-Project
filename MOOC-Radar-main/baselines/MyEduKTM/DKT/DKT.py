@@ -6,11 +6,10 @@ import logging
 import numpy as np
 import torch
 import tqdm
+from EduKTM import KTM
+from sklearn.metrics import roc_auc_score
 from torch import nn
 from torch.autograd import Variable
-from sklearn.metrics import roc_auc_score
-
-from EduKTM import KTM
 
 # 添加设备检测
 #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -14,8 +14,10 @@ def collate_fn_with_context(batch, pad_val: int = -1):
     ctx_main_seqs: List[torch.Tensor] = []
     ctx_tpl_seqs: List[torch.Tensor] = []
     ctx_llm_seqs: List[torch.Tensor] = []
+    ctx_llm_struct_seqs: List[torch.Tensor] = []
+    ctx_llm_struct_feature_seqs: List[torch.Tensor] = []
 
-    for q_seq, r_seq, ctx_main_seq, ctx_tpl_seq, ctx_llm_seq in batch:
+    for q_seq, r_seq, ctx_main_seq, ctx_tpl_seq, ctx_llm_seq, ctx_llm_struct_seq, ctx_llm_struct_feature_seq in batch:
         q_seqs.append(torch.tensor(q_seq[:-1], dtype=torch.long))
         r_seqs.append(torch.tensor(r_seq[:-1], dtype=torch.long))
         qshft_seqs.append(torch.tensor(q_seq[1:], dtype=torch.long))
@@ -23,6 +25,8 @@ def collate_fn_with_context(batch, pad_val: int = -1):
         ctx_main_seqs.append(torch.tensor(ctx_main_seq[1:], dtype=torch.float32))
         ctx_tpl_seqs.append(torch.tensor(ctx_tpl_seq[1:], dtype=torch.float32))
         ctx_llm_seqs.append(torch.tensor(ctx_llm_seq[1:], dtype=torch.float32))
+        ctx_llm_struct_seqs.append(torch.tensor(ctx_llm_struct_seq[1:], dtype=torch.float32))
+        ctx_llm_struct_feature_seqs.append(torch.tensor(ctx_llm_struct_feature_seq[1:], dtype=torch.float32))
 
     q_seqs = pad_sequence(q_seqs, batch_first=True, padding_value=pad_val)
     r_seqs = pad_sequence(r_seqs, batch_first=True, padding_value=pad_val)
@@ -31,6 +35,8 @@ def collate_fn_with_context(batch, pad_val: int = -1):
     ctx_main_seqs = pad_sequence(ctx_main_seqs, batch_first=True, padding_value=0.0)
     ctx_tpl_seqs = pad_sequence(ctx_tpl_seqs, batch_first=True, padding_value=0.0)
     ctx_llm_seqs = pad_sequence(ctx_llm_seqs, batch_first=True, padding_value=0.0)
+    ctx_llm_struct_seqs = pad_sequence(ctx_llm_struct_seqs, batch_first=True, padding_value=0.0)
+    ctx_llm_struct_feature_seqs = pad_sequence(ctx_llm_struct_feature_seqs, batch_first=True, padding_value=0.0)
 
     mask_seqs = (q_seqs != pad_val) & (qshft_seqs != pad_val)
     q_seqs = q_seqs.masked_fill(~mask_seqs, 0)
@@ -40,5 +46,18 @@ def collate_fn_with_context(batch, pad_val: int = -1):
     ctx_main_seqs = ctx_main_seqs * mask_seqs.unsqueeze(-1)
     ctx_tpl_seqs = ctx_tpl_seqs * mask_seqs.unsqueeze(-1)
     ctx_llm_seqs = ctx_llm_seqs * mask_seqs.unsqueeze(-1)
+    ctx_llm_struct_seqs = ctx_llm_struct_seqs * mask_seqs.unsqueeze(-1)
+    ctx_llm_struct_feature_seqs = ctx_llm_struct_feature_seqs * mask_seqs.unsqueeze(-1)
 
-    return q_seqs, r_seqs, qshft_seqs, rshft_seqs, mask_seqs, ctx_main_seqs, ctx_tpl_seqs, ctx_llm_seqs
+    return (
+        q_seqs,
+        r_seqs,
+        qshft_seqs,
+        rshft_seqs,
+        mask_seqs,
+        ctx_main_seqs,
+        ctx_tpl_seqs,
+        ctx_llm_seqs,
+        ctx_llm_struct_seqs,
+        ctx_llm_struct_feature_seqs,
+    )

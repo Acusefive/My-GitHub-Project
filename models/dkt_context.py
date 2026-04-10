@@ -1,7 +1,7 @@
 import torch
 
 from torch.nn import Module, Embedding, LSTM, Linear, Dropout
-from torch.nn.functional import one_hot
+from torch.nn.functional import embedding
 
 from models.context_fusion import ContextFusion
 
@@ -28,7 +28,9 @@ class DKTContext(Module):
         if ctx is not None:
             h = self.context_fusion(h, ctx)
 
-        y = self.out_layer(self.dropout_layer(h))
-        y = torch.sigmoid(y)
-        p = (y * one_hot(qry.long(), self.num_q)).sum(-1)
+        h = self.dropout_layer(h)
+        target_weight = embedding(qry.long(), self.out_layer.weight)
+        target_bias = embedding(qry.long(), self.out_layer.bias.unsqueeze(-1)).squeeze(-1)
+        logits = (h * target_weight).sum(-1) + target_bias
+        p = torch.sigmoid(logits)
         return p

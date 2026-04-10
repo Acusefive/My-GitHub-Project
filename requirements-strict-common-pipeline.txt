@@ -5,3 +5,4 @@ scikit-learn
 jieba
 gensim
 tqdm
+transformers>=4.51.0

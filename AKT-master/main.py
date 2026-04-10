@@ -8,6 +8,13 @@ import numpy as np
 import pickle
 import torch
 from load_data import DATA, PID_DATA
+from prepare_moocradar_semantic_chunks import (
+    build_students_and_semantic,
+    chunk_and_pad_semantic,
+    load_json,
+    load_pickle,
+    split_train_valid_test,
+)
 from run import train, test
 from utils import try_makedirs, load_model, get_file_name_identifier
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -156,6 +163,76 @@ def test_one_dataset(
         os.remove(i)
 
 
+def maybe_prepare_moocradar_semantic_files(params):
+    base = os.path.join(params.data_dir, params.data_name)
+    train_sem_path = base + "_train_sem.pkl"
+    valid_sem_path = base + "_valid_sem.pkl"
+    test_sem_path = base + "_test_sem.pkl"
+
+    if (
+        os.path.exists(train_sem_path)
+        and os.path.exists(valid_sem_path)
+        and os.path.exists(test_sem_path)
+    ):
+        return train_sem_path, valid_sem_path, test_sem_path
+
+    if getattr(params, "disable_auto_semantic_prepare", False):
+        return train_sem_path, valid_sem_path, test_sem_path
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    workspace_root = os.path.dirname(script_dir)
+    raw_json_path = params.moocradar_raw_json or os.path.join(
+        script_dir, "data", "MOOCRadar", "student-problem-fine.json"
+    )
+    semantic_pkl_path = params.cognitive_embeddings_pkl or os.path.join(
+        workspace_root, "cachelocal", "cognitive_embeddings.pkl"
+    )
+
+    if not os.path.exists(raw_json_path):
+        print(f"Warning: raw MOOCRadar json not found, skip auto semantic chunking: {raw_json_path}")
+        return train_sem_path, valid_sem_path, test_sem_path
+
+    if not os.path.exists(semantic_pkl_path):
+        print(f"Warning: cognitive embeddings pkl not found, skip auto semantic chunking: {semantic_pkl_path}")
+        return train_sem_path, valid_sem_path, test_sem_path
+
+    print("\nPreparing aligned semantic chunks for moocradar_pid from Cognitive-RAG cache ...")
+    raw_students = load_json(raw_json_path)
+    semantic_by_student = load_pickle(semantic_pkl_path)
+    items = build_students_and_semantic(raw_students, semantic_by_student)
+    train_items, valid_items, test_items = split_train_valid_test(
+        items,
+        train_ratio=0.8,
+        valid_ratio=0.1,
+        seed=params.seed,
+    )
+
+    semantic_dim = int(getattr(params, "input_semantic_dim", 512))
+    train_sem = chunk_and_pad_semantic(
+        train_items, seqlen=params.seqlen, semantic_dim=semantic_dim
+    )
+    valid_sem = chunk_and_pad_semantic(
+        valid_items, seqlen=params.seqlen, semantic_dim=semantic_dim
+    )
+    test_sem = chunk_and_pad_semantic(
+        test_items, seqlen=params.seqlen, semantic_dim=semantic_dim
+    )
+
+    try_makedirs(params.data_dir)
+    with open(train_sem_path, "wb") as f:
+        pickle.dump(train_sem, f)
+    with open(valid_sem_path, "wb") as f:
+        pickle.dump(valid_sem, f)
+    with open(test_sem_path, "wb") as f:
+        pickle.dump(test_sem, f)
+
+    print("Saved semantic chunks:")
+    print(" ", train_sem_path, train_sem.shape)
+    print(" ", valid_sem_path, valid_sem.shape)
+    print(" ", test_sem_path, test_sem.shape)
+    return train_sem_path, valid_sem_path, test_sem_path
+
+
 if __name__ == '__main__':
 
     # Parse Arguments
@@ -218,6 +295,14 @@ if __name__ == '__main__':
     # Semantic Early Fusion (optional)
     parser.add_argument('--use_early_fusion', action='store_true', help='是否启用语义向量早期融合')
     parser.add_argument('--input_semantic_dim', type=int, default=512, help='语义向量维度')
+    parser.add_argument('--disable_early_fusion', action='store_true',
+                        help='disable semantic early fusion and FiLM for moocradar_pid')
+    parser.add_argument('--disable_auto_semantic_prepare', action='store_true',
+                        help='disable auto generation of aligned *_sem.pkl files for moocradar_pid')
+    parser.add_argument('--cognitive_embeddings_pkl', type=str, default='',
+                        help='path to the full Cognitive-RAG cognitive_embeddings.pkl')
+    parser.add_argument('--moocradar_raw_json', type=str, default='',
+                        help='path to raw MOOCRadar student-problem-fine.json')
 
     params = parser.parse_args()
     dataset = params.dataset
@@ -233,6 +318,8 @@ if __name__ == '__main__':
         params.l2 = 5e-5
         # 语义向量维度（与 MOOC-Radar 认知向量保持一致）
         params.semantic_dim = 512
+        if not params.disable_early_fusion:
+            params.use_early_fusion = True
 
     if dataset in {"assist2009_pid"}:
         params.n_question = 110
@@ -303,10 +390,7 @@ if __name__ == '__main__':
     valid_semantic = None
     test_semantic = None
     if dataset in {"moocradar_pid"}:
-        base = os.path.join(params.data_dir, params.data_name)
-        train_sem_path = base + "_train_sem.pkl"
-        valid_sem_path = base + "_valid_sem.pkl"
-        test_sem_path = base + "_test_sem.pkl"
+        train_sem_path, valid_sem_path, test_sem_path = maybe_prepare_moocradar_semantic_files(params)
         if os.path.exists(train_sem_path) and os.path.exists(valid_sem_path) and os.path.exists(test_sem_path):
             with open(train_sem_path, "rb") as f:
                 train_semantic = pickle.load(f)
@@ -329,8 +413,10 @@ if __name__ == '__main__':
                     f"train_sem={len(train_semantic)}, train_q={train_q_data.shape[0]}, "
                     f"valid_sem={len(valid_semantic)}, valid_q={valid_q_data.shape[0]}"
                 )
+            if not params.use_early_fusion:
+                print("Hint: semantic tensors are loaded but use_early_fusion is disabled.")
         else:
-            print("警告：未找到 moocradar_pid 对应的 *_sem.pkl 文件，AKT 将在无语义模式下训练。")
+            print("Warning: moocradar_pid semantic chunk files were not found; AKT will train without semantic fusion.")
 
     print("\n")
     print("train_q_data.shape", train_q_data.shape)

@@ -15,18 +15,19 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from gensim.models import Word2Vec
-from sentence_transformers import SentenceTransformer
 from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import CountVectorizer
 from tqdm import tqdm
 
 from .constants import (
     A_SCALE,
-    BGE_MODEL_NAME,
     COLLAB_WINDOW,
     CTFIDF_MAX_FEATURES,
     DS,
     EPS,
+    GRAPH_LLM_CANDIDATE_LIMIT,
+    GRAPH_LLM_MAX_PREREQ,
+    GRAPH_LLM_MAX_RELATED,
     HISTORY_WINDOW,
     KGLOBAL,
     KLOCAL,
@@ -47,6 +48,9 @@ from .constants import (
     SMOKE_TRAIN_MAX_SAMPLES,
     STOP_WORDS,
     TAU,
+    TEXT_EMBED_BATCH_SIZE,
+    TEXT_EMBED_MAX_LENGTH,
+    TEXT_EMBED_MODEL_NAME,
     TRAIN_BATCH_SIZE,
     TRAIN_EARLY_STOP_PATIENCE,
     TRAIN_GRAD_CLIP,
@@ -65,12 +69,13 @@ from .io_utils import (
     load_problem_records,
     load_student_sequences,
     pick_device,
-    resolve_local_sentence_transformer_path,
     user_hash_bucket,
     write_json,
     write_jsonl,
 )
+from .llm_utils import OpenAICompatibleGraphCompleter, append_json_cache, load_json_cache
 from .models import StrictPriorModel
+from .retrieval_models import QwenEmbeddingEncoder
 
 
 @dataclass
@@ -377,7 +382,7 @@ def build_collaborative_vectors(
     return neighbors, vectors
 
 
-def build_graph_bundle(problem_records: Sequence[ProblemRecord]) -> Dict[str, Any]:
+def _collect_concept_stats(problem_records: Sequence[ProblemRecord]) -> Tuple[Dict[str, set[str]], Dict[Tuple[str, str], int]]:
     concept_to_chapters: Dict[str, set[str]] = defaultdict(set)
     local_counts: Dict[Tuple[str, str], int] = defaultdict(int)
     for problem in problem_records:
@@ -389,9 +394,78 @@ def build_graph_bundle(problem_records: Sequence[ProblemRecord]) -> Dict[str, An
             for right in unique_concepts[i + 1 :]:
                 pair = (left, right) if left < right else (right, left)
                 local_counts[pair] += 1
+    return concept_to_chapters, local_counts
+
+
+def _llm_graph_completion(
+    *,
+    problem_records: Sequence[ProblemRecord],
+    priors_dir: Path,
+    completer: Optional[OpenAICompatibleGraphCompleter],
+) -> Dict[str, Dict[str, Any]]:
+    if completer is None:
+        return {}
+
+    cache_path = priors_dir / "llm_graph_completion_cache.jsonl"
+    llm_cache = load_json_cache(cache_path)
+    concept_to_chapters, local_counts = _collect_concept_stats(problem_records)
+    chapter_to_concepts: Dict[str, set[str]] = defaultdict(set)
+    for concept, chapters in concept_to_chapters.items():
+        for chapter in chapters:
+            chapter_to_concepts[chapter].add(concept)
+
+    concept_candidates: Dict[str, List[str]] = {}
+    for concept in sorted(concept_to_chapters):
+        candidates: set[str] = set()
+        for chapter in concept_to_chapters[concept]:
+            candidates.update(chapter_to_concepts.get(chapter, set()))
+        pair_scores: List[Tuple[int, str]] = []
+        for (left, right), count in local_counts.items():
+            if left == concept:
+                pair_scores.append((count, right))
+            elif right == concept:
+                pair_scores.append((count, left))
+        pair_scores.sort(key=lambda item: (-item[0], item[1]))
+        for _count, other in pair_scores[:GRAPH_LLM_CANDIDATE_LIMIT]:
+            candidates.add(other)
+        candidates.discard(concept)
+        concept_candidates[concept] = sorted(candidates)[:GRAPH_LLM_CANDIDATE_LIMIT]
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for concept, candidates in tqdm(concept_candidates.items(), desc="strict llm graph"):
+        if not candidates:
+            continue
+        payload = llm_cache.get(concept)
+        if payload is None:
+            payload = completer.complete(
+                concept=concept,
+                chapters=sorted(concept_to_chapters.get(concept, set())),
+                candidate_concepts=candidates,
+            )
+            llm_cache[concept] = payload
+            append_json_cache(cache_path, concept, payload)
+        prereq = [item for item in payload.get("prerequisite_candidates", []) if item in candidates][:GRAPH_LLM_MAX_PREREQ]
+        related = [item for item in payload.get("related_candidates", []) if item in candidates][:GRAPH_LLM_MAX_RELATED]
+        out[concept] = {
+            "prerequisite_candidates": prereq,
+            "related_candidates": related,
+            "confidence": payload.get("confidence", "低"),
+            "chapters": sorted(concept_to_chapters.get(concept, set())),
+            "candidate_concepts": candidates,
+        }
+    return out
+
+
+def build_graph_bundle(
+    problem_records: Sequence[ProblemRecord],
+    *,
+    llm_graph_completion: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    concept_to_chapters, local_counts = _collect_concept_stats(problem_records)
 
     concept_neighbors: Dict[str, set[str]] = defaultdict(set)
     local_edges: List[Dict[str, Any]] = []
+    prerequisite_edges: List[Dict[str, Any]] = []
 
     chapter_to_concepts: Dict[str, set[str]] = defaultdict(set)
     for concept, chapters in concept_to_chapters.items():
@@ -413,6 +487,32 @@ def build_graph_bundle(problem_records: Sequence[ProblemRecord]) -> Dict[str, An
         concept_neighbors[right].add(left)
         local_edges.append({"src": left, "dst": right, "source": "cofreq", "count": count})
 
+    llm_graph_completion = llm_graph_completion or {}
+    for concept, payload in sorted(llm_graph_completion.items()):
+        confidence = str(payload.get("confidence") or "低")
+        for prereq in payload.get("prerequisite_candidates", []) or []:
+            concept_neighbors[concept].add(prereq)
+            concept_neighbors[prereq].add(concept)
+            edge = {
+                "src": prereq,
+                "dst": concept,
+                "source": "llm_prerequisite",
+                "confidence": confidence,
+            }
+            prerequisite_edges.append(edge)
+            local_edges.append(edge)
+        for related in payload.get("related_candidates", []) or []:
+            concept_neighbors[concept].add(related)
+            concept_neighbors[related].add(concept)
+            local_edges.append(
+                {
+                    "src": concept,
+                    "dst": related,
+                    "source": "llm_related",
+                    "confidence": confidence,
+                }
+            )
+
     problem_neighbor_concepts: Dict[str, List[str]] = {}
     for problem in problem_records:
         neighbor_set = set()
@@ -422,12 +522,13 @@ def build_graph_bundle(problem_records: Sequence[ProblemRecord]) -> Dict[str, An
         problem_neighbor_concepts[problem.problem_id] = sorted(neighbor_set)
 
     return {
-        "has_explicit_prerequisite": False,
-        "e_pre": [],
+        "has_explicit_prerequisite": bool(prerequisite_edges),
+        "e_pre": prerequisite_edges,
         "tau_localco": LOCAL_COOCCUR_THRESHOLD,
         "concept_neighbors": {concept: sorted(neighbors) for concept, neighbors in sorted(concept_neighbors.items())},
         "problem_neighbor_concepts": problem_neighbor_concepts,
         "local_edges": local_edges,
+        "llm_graph_completion": llm_graph_completion,
     }
 
 
@@ -481,9 +582,10 @@ def build_target_samples(
     rng.shuffle(train_samples)
     rng.shuffle(val_samples)
     if not val_samples and train_samples:
-        fallback_val = max(1, min(len(train_samples) // 10, 32))
-        val_samples = train_samples[:fallback_val]
-        train_samples = train_samples[fallback_val:]
+        raise ValueError(
+            "Validation sample set is empty under strict full-system mode; "
+            "refusing to synthesize fallback validation samples."
+        )
     if smoke:
         train_samples = train_samples[:SMOKE_TRAIN_MAX_SAMPLES]
         val_samples = val_samples[: max(1, SMOKE_TRAIN_MAX_SAMPLES // 8)]
@@ -597,7 +699,8 @@ def train_strict_model(
     train_samples, val_samples = build_target_samples(sequence_cache, smoke=smoke, seed=seed)
 
     device = pick_device()
-    model = StrictPriorModel().to(device)
+    eq_input_dim = int(hqtext_vectors.shape[1] + hqid_vectors.shape[1])
+    model = StrictPriorModel(eq_input_dim=eq_input_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=TRAIN_LR)
 
     hqtext_tensor = torch.tensor(hqtext_vectors.astype(np.float32), dtype=torch.float32, device=device)
@@ -700,7 +803,17 @@ def train_strict_model(
     }
     model_state_path = priors_dir / "model_state.pt"
     training_report_path = priors_dir / "training_report.json"
-    torch.save({"state_dict": model.state_dict()}, model_state_path)
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "model_meta": {
+                "eq_input_dim": eq_input_dim,
+                "hqtext_dim": int(hqtext_vectors.shape[1]),
+                "hqid_dim": int(hqid_vectors.shape[1]),
+            },
+        },
+        model_state_path,
+    )
     write_json(training_report, training_report_path)
     return model.cpu(), training_report
 
@@ -718,6 +831,15 @@ def run_stage32(
     priors_dir: Path,
     seed: int = TRAIN_SEED,
     smoke: bool = False,
+    text_embed_model: str = TEXT_EMBED_MODEL_NAME,
+    text_embed_batch_size: int = TEXT_EMBED_BATCH_SIZE,
+    enable_llm_graph_completion: bool = False,
+    llm_base_url: str = "",
+    llm_model: str = "",
+    llm_api_key: str = "",
+    llm_timeout_sec: int = 120,
+    llm_max_tokens: int = 160,
+    llm_temperature: float = 0.1,
 ) -> Stage32Result:
     ensure_dir(priors_dir)
     problem_records = load_problem_records(
@@ -734,26 +856,21 @@ def run_stage32(
     if not student_sequences:
         raise ValueError("No student sequences loaded for strict stage 3.2")
 
-    local_model_path = resolve_local_sentence_transformer_path(BGE_MODEL_NAME)
-    model = SentenceTransformer(str(local_model_path) if local_model_path else BGE_MODEL_NAME, local_files_only=bool(local_model_path))
+    encoder = QwenEmbeddingEncoder(
+        model_name_or_path=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
+        device=pick_device(),
+        max_length=TEXT_EMBED_MAX_LENGTH,
+        batch_size=int(text_embed_batch_size),
+    )
     raw_texts = [problem.text or problem.title or problem.problem_id for problem in problem_records]
     concept_groups = build_concept_groups(problem_records)
-    hqtext_vectors = model.encode(
-        raw_texts,
-        batch_size=32,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-    )
-    hqtext_vectors = np.asarray(hqtext_vectors.tolist(), dtype=np.float32)
+    hqtext_vectors = encoder.encode_texts(raw_texts, instruction="Encode educational problem text for semantic clustering and downstream retrieval.")
     semantic_ids_path = priors_dir / "semantic_ids.json"
     semantic_ids, semantic_id_texts = build_semantic_ids(problem_records, hqtext_vectors, semantic_ids_path=semantic_ids_path)
-    hqid_vectors = model.encode(
+    hqid_vectors = encoder.encode_texts(
         semantic_id_texts,
-        batch_size=32,
-        show_progress_bar=True,
-        convert_to_numpy=True,
+        instruction="Encode hierarchical semantic identifiers for educational problem semantics.",
     )
-    hqid_vectors = np.asarray(hqid_vectors.tolist(), dtype=np.float32)
 
     pid_to_idx = {problem.problem_id: idx for idx, problem in enumerate(problem_records)}
     pid_to_mu_q = (
@@ -794,7 +911,22 @@ def run_stage32(
         [problem.problem_id for problem in problem_records],
         seed=seed,
     )
-    graph_bundle = build_graph_bundle(problem_records)
+    graph_completer = None
+    if enable_llm_graph_completion:
+        graph_completer = OpenAICompatibleGraphCompleter(
+            base_url=str(llm_base_url or ""),
+            model=str(llm_model or ""),
+            api_key=llm_api_key,
+            timeout_sec=int(llm_timeout_sec),
+            max_tokens=int(llm_max_tokens),
+            temperature=float(llm_temperature),
+        )
+    llm_graph_completion = _llm_graph_completion(
+        problem_records=problem_records,
+        priors_dir=priors_dir,
+        completer=graph_completer,
+    )
+    graph_bundle = build_graph_bundle(problem_records, llm_graph_completion=llm_graph_completion)
 
     semantic_vectors = {problem.problem_id: eqsem_vectors[idx] for idx, problem in enumerate(problem_records)}
     hqtext_map = {problem.problem_id: hqtext_vectors[idx] for idx, problem in enumerate(problem_records)}
@@ -828,7 +960,8 @@ def run_stage32(
     write_jsonl(dataclass_list_to_jsonl(catalog_records), problem_catalog_path)
 
     implementation_defaults = {
-        "bge_model_name": BGE_MODEL_NAME,
+        "text_embed_model_name": str(text_embed_model or TEXT_EMBED_MODEL_NAME),
+        "text_embed_batch_size": int(text_embed_batch_size),
         "kglobal": KGLOBAL,
         "klocal": KLOCAL,
         "random_state": KMEANS_RANDOM_STATE,
@@ -838,8 +971,9 @@ def run_stage32(
         "collab_window": COLLAB_WINDOW,
         "negative_samples": NEGATIVE_SAMPLES,
         "local_cooccur_threshold": LOCAL_COOCCUR_THRESHOLD,
-        "rasch_a": A_SCALE,
+        "rasch_a": RASCH_A,
         "use_rasch_enhancement": USE_RASCH_ENHANCEMENT,
+        "enable_llm_graph_completion": bool(enable_llm_graph_completion),
         "train_lr": TRAIN_LR,
         "train_grad_clip": TRAIN_GRAD_CLIP,
         "lambda_l": LAMBDA_L,

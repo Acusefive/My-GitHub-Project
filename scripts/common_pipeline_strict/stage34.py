@@ -9,14 +9,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 from .constants import (
     ALPHA_TIME,
     BETA_NEG,
     BETA_POS,
-    BGE_MODEL_NAME,
     COVERAGE_WEIGHTS,
     DELTA_GRAPH,
     EPS,
@@ -31,6 +29,8 @@ from .constants import (
     QUESTION_TEXT_ELLIPSIS,
     QUESTION_TEXT_LIMIT,
     REDUNDANCY_WEIGHTS,
+    RERANK_TOPK,
+    RERANK_WEIGHT,
     ROLE_LABELS,
     ROLE_ORDER,
     ROLE_PRIORITY,
@@ -38,6 +38,13 @@ from .constants import (
     RHO,
     SUMMARY_TEMPLATE,
     SUPPORT_SCORE_DECIMALS,
+    TEXT_EMBED_BATCH_SIZE,
+    TEXT_EMBED_MAX_LENGTH,
+    TEXT_EMBED_MODEL_NAME,
+    TEXT_RERANK_BATCH_SIZE,
+    TEXT_RERANK_MAX_LENGTH,
+    TEXT_RERANK_MODEL_NAME,
+    USE_QWEN_RERANKER,
     WEIGHT_STAGE1,
     WEIGHT_STAGE2,
 )
@@ -48,11 +55,18 @@ from .io_utils import (
     load_problem_records,
     load_student_sequences,
     pick_device,
-    resolve_local_sentence_transformer_path,
     write_json,
 )
-from .llm_utils import OpenAICompatibleSummarizer, append_summary_cache, load_summary_cache, summary_cache_key
+from .llm_utils import (
+    OpenAICompatibleSummarizer,
+    append_summary_cache,
+    load_json_cache,
+    load_summary_cache,
+    parse_llm_summary_json,
+    summary_cache_key,
+)
 from .models import load_strict_prior_model
+from .retrieval_models import QwenEmbeddingEncoder, QwenReranker
 
 
 @dataclass
@@ -62,6 +76,17 @@ class Stage34Result:
     embeddings_path: Optional[str]
     manifest_path: str
     record_count: int
+    text_embed_model: str
+    text_embed_batch_size: int
+    text_rerank_model: str
+    text_rerank_batch_size: int
+    use_qwen_reranker: bool
+    rerank_topk: int
+    rerank_weight: float
+    reranker_cache_path: Optional[str]
+    context_shard_index: int
+    context_num_shards: int
+    merge_context_shards: bool
 
 
 def _normalize_matrix(matrix: np.ndarray) -> np.ndarray:
@@ -121,6 +146,12 @@ class GraphAccessor:
             str(concept): set(neighbors)
             for concept, neighbors in (graph_bundle.get("concept_neighbors") or {}).items()
         }
+        self.prerequisite_map: Dict[str, set[str]] = {}
+        for edge in graph_bundle.get("e_pre") or []:
+            src = str(edge.get("src") or "").strip()
+            dst = str(edge.get("dst") or "").strip()
+            if src and dst:
+                self.prerequisite_map.setdefault(dst, set()).add(src)
         self.problem_neighbor_concepts = {
             str(pid): list(neighbors)
             for pid, neighbors in (graph_bundle.get("problem_neighbor_concepts") or {}).items()
@@ -133,6 +164,8 @@ class GraphAccessor:
         best = 0.0
         target_set = set(concepts_t)
         for concept_i in concepts_i:
+            if any(concept_i in self.prerequisite_map.get(target, set()) for target in target_set):
+                best = max(best, 0.75 * math.exp(-DELTA_GRAPH * 1.0))
             neigh = self.concept_neighbors.get(concept_i, set())
             if neigh & target_set:
                 best = max(best, 0.5 * math.exp(-DELTA_GRAPH * 1.0))
@@ -541,11 +574,67 @@ def _summary_fields(
 
 
 def _build_llm_context_text(llm_summary_text: str, main_context_text: str) -> str:
-    summary = " ".join(str(llm_summary_text or "").split())
+    parsed = parse_llm_summary_json(str(llm_summary_text or ""))
+    parts: List[str] = []
+    if parsed["summary"]:
+        parts.append(parsed["summary"])
+    if parsed["stable_points"]:
+        parts.append("稳定掌握点:" + "；".join(parsed["stable_points"]))
+    if parsed["weak_points"]:
+        parts.append("持续薄弱点:" + "；".join(parsed["weak_points"]))
+    parts.append(f"近期波动性:{parsed['volatility']}")
+    parts.append(f"摘要置信度:{parsed['confidence']}")
+    summary = " ".join(part.strip() for part in parts if part.strip())
     main = str(main_context_text or "").strip()
     if summary and main:
         return summary + "\n" + main
     return summary or main
+
+
+def _build_llm_struct_texts(record: Dict[str, Any]) -> Dict[str, str]:
+    llm_summary_text = str(record.get("summary_fields", {}).get("llm_summary_text") or "").strip()
+    parsed = parse_llm_summary_json(llm_summary_text)
+    stable_text = "；".join(parsed["stable_points"])
+    weak_text = "；".join(parsed["weak_points"])
+    summary_text = parsed["summary"]
+    volatility = parsed["volatility"]
+    confidence = parsed["confidence"]
+    aux_text = f"波动性:{volatility} 置信度:{confidence}"
+    return {
+        "stable_text": stable_text,
+        "weak_text": weak_text,
+        "summary_text": summary_text,
+        "aux_text": aux_text,
+    }
+
+
+def _build_llm_struct_feature_vector(record: Dict[str, Any]) -> np.ndarray:
+    llm_summary_text = str(record.get("summary_fields", {}).get("llm_summary_text") or "").strip()
+    parsed = parse_llm_summary_json(llm_summary_text)
+    stable_points = [str(item).strip() for item in parsed["stable_points"] if str(item).strip()]
+    weak_points = [str(item).strip() for item in parsed["weak_points"] if str(item).strip()]
+    summary = str(parsed["summary"]).strip()
+
+    volatility = str(parsed["volatility"])
+    confidence = str(parsed["confidence"])
+    levels = ("低", "中", "高")
+
+    volatility_onehot = [1.0 if volatility == level else 0.0 for level in levels]
+    confidence_onehot = [1.0 if confidence == level else 0.0 for level in levels]
+
+    features = np.asarray(
+        [
+            float(len(stable_points)) / 2.0,
+            float(len(weak_points)) / 2.0,
+            1.0 if stable_points else 0.0,
+            1.0 if weak_points else 0.0,
+            min(float(len(summary)), 60.0) / 60.0,
+            *volatility_onehot,
+            *confidence_onehot,
+        ],
+        dtype=np.float32,
+    )
+    return features
 
 
 def _load_index_records_from_contexts(contexts_path: Path) -> Tuple[List[Dict[str, Any]], int]:
@@ -567,22 +656,70 @@ def _load_index_records_from_contexts(contexts_path: Path) -> Tuple[List[Dict[st
     return index_records, record_count
 
 
+def _shard_suffix(shard_index: int, shard_count: int) -> str:
+    return f"shard_{int(shard_index):02d}_of_{int(shard_count):02d}"
+
+
+def _merge_context_shards(
+    *,
+    contexts_dir: Path,
+    reports_dir: Path,
+    shard_count: int,
+    preview_limit: int,
+    output_contexts_path: Path,
+    output_preview_path: Path,
+) -> int:
+    shard_dir = contexts_dir / "shards"
+    records: List[Dict[str, Any]] = []
+    for shard_index in range(int(shard_count)):
+        shard_path = shard_dir / f"contexts.{_shard_suffix(shard_index, shard_count)}.jsonl"
+        if not shard_path.exists():
+            raise FileNotFoundError(f"Missing shard contexts file: {shard_path}")
+        with shard_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                records.append(json.loads(line))
+    records.sort(key=lambda item: (str(item["user_id"]), int(item["target_t"]), str(item["target_pid"])))
+    with output_contexts_path.open("w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    preview_lines: List[str] = []
+    for record in records[: max(0, int(preview_limit))]:
+        preview_lines.append(
+            f"--- {record['user_id']} @ t={int(record['target_t'])} / {record['target_pid']} ---\n"
+            f"[MAIN]\n{str(record.get('main_context_text') or '').strip()}\n\n"
+            f"[TEMPLATE]\n{str(record.get('template_context_text') or '').strip()}\n"
+        )
+    atomic_save_text("\n\n".join(preview_lines), output_preview_path)
+    return len(records)
+
+
 def _build_context_embeddings(
     *,
     contexts_path: Path,
     cache_dir: Path,
     device: str,
+    text_embed_model: str,
+    text_embed_batch_size: int,
 ) -> Path:
-    local_model_path = resolve_local_sentence_transformer_path(BGE_MODEL_NAME)
-    encoder = SentenceTransformer(
-        str(local_model_path) if local_model_path else BGE_MODEL_NAME,
-        local_files_only=bool(local_model_path),
+    encoder = QwenEmbeddingEncoder(
+        model_name_or_path=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
         device=device,
+        max_length=TEXT_EMBED_MAX_LENGTH,
+        batch_size=int(text_embed_batch_size),
     )
     index_records, _record_count = _load_index_records_from_contexts(contexts_path)
     main_texts: List[str] = []
     template_texts: List[str] = []
     llm_texts: List[str] = []
+    stable_texts: List[str] = []
+    weak_texts: List[str] = []
+    struct_summary_texts: List[str] = []
+    aux_texts: List[str] = []
+    struct_feature_rows: List[np.ndarray] = []
+    has_any_llm_summary = False
     with contexts_path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
             if not line.strip():
@@ -590,16 +727,75 @@ def _build_context_embeddings(
             record = json.loads(line)
             main_texts.append(record["main_context_text"])
             template_texts.append(record["template_context_text"])
-            llm_texts.append(record.get("llm_context_text") or "")
-    main_embeddings = encoder.encode(main_texts, batch_size=32, show_progress_bar=True, convert_to_numpy=True)
-    template_embeddings = encoder.encode(template_texts, batch_size=32, show_progress_bar=True, convert_to_numpy=True)
+            llm_summary_text = str(record.get("summary_fields", {}).get("llm_summary_text") or "").strip()
+            llm_context_text = str(record.get("llm_context_text") or "").strip()
+            if llm_summary_text:
+                has_any_llm_summary = True
+                if not llm_context_text:
+                    raise ValueError("Found llm_summary_text but llm_context_text is empty")
+                llm_texts.append(llm_context_text)
+                struct_texts = _build_llm_struct_texts(record)
+                stable_texts.append(struct_texts["stable_text"])
+                weak_texts.append(struct_texts["weak_text"])
+                struct_summary_texts.append(struct_texts["summary_text"])
+                aux_texts.append(struct_texts["aux_text"])
+                struct_feature_rows.append(_build_llm_struct_feature_vector(record))
+            else:
+                llm_texts.append("")
+                stable_texts.append("")
+                weak_texts.append("")
+                struct_summary_texts.append("")
+                aux_texts.append("")
+                struct_feature_rows.append(np.zeros((11,), dtype=np.float32))
+    main_embeddings = encoder.encode_texts(
+        main_texts,
+        instruction="Encode retrieved educational evidence context for downstream knowledge tracing.",
+    )
+    template_embeddings = encoder.encode_texts(
+        template_texts,
+        instruction="Encode summary-augmented educational evidence context for downstream knowledge tracing.",
+    )
     llm_embeddings = None
-    if any(text.strip() for text in llm_texts):
-        llm_embeddings = encoder.encode(llm_texts, batch_size=32, show_progress_bar=True, convert_to_numpy=True)
-    main_embeddings = np.asarray(main_embeddings.tolist(), dtype=np.float32)
-    template_embeddings = np.asarray(template_embeddings.tolist(), dtype=np.float32)
+    if has_any_llm_summary:
+        if not all(text.strip() for text in llm_texts):
+            raise ValueError("LLM summaries are partially missing; strict full-system mode requires full llm coverage")
+        llm_embeddings = encoder.encode_texts(
+            llm_texts,
+            instruction="Encode LLM-enhanced cognitive context for downstream knowledge tracing.",
+        )
+    llm_struct_embeddings = None
+    llm_struct_features = None
+    if has_any_llm_summary:
+        stable_embeddings = encoder.encode_texts(
+            stable_texts,
+            instruction="Encode stable cognitive mastery points extracted from LLM structured summaries.",
+        )
+        weak_embeddings = encoder.encode_texts(
+            weak_texts,
+            instruction="Encode weak cognitive points extracted from LLM structured summaries.",
+        )
+        summary_embeddings = encoder.encode_texts(
+            struct_summary_texts,
+            instruction="Encode concise cognitive state summaries extracted from LLM structured summaries.",
+        )
+        aux_embeddings = encoder.encode_texts(
+            aux_texts,
+            instruction="Encode volatility and confidence descriptors extracted from LLM structured summaries.",
+        )
+        llm_struct_embeddings = np.concatenate(
+            [
+                np.asarray(stable_embeddings, dtype=np.float32),
+                np.asarray(weak_embeddings, dtype=np.float32),
+                np.asarray(summary_embeddings, dtype=np.float32),
+                np.asarray(aux_embeddings, dtype=np.float32),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        llm_struct_features = np.stack(struct_feature_rows, axis=0).astype(np.float32)
+    main_embeddings = np.asarray(main_embeddings, dtype=np.float32)
+    template_embeddings = np.asarray(template_embeddings, dtype=np.float32)
     if llm_embeddings is not None:
-        llm_embeddings = np.asarray(llm_embeddings.tolist(), dtype=np.float32)
+        llm_embeddings = np.asarray(llm_embeddings, dtype=np.float32)
     embeddings_path = cache_dir / "context_embeddings.pkl"
     with embeddings_path.open("wb") as f:
         payload = {
@@ -609,6 +805,10 @@ def _build_context_embeddings(
         }
         if llm_embeddings is not None:
             payload["llm_embeddings"] = llm_embeddings
+        if llm_struct_embeddings is not None:
+            payload["llm_struct_embeddings"] = llm_struct_embeddings
+        if llm_struct_features is not None:
+            payload["llm_struct_features"] = llm_struct_features
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     return embeddings_path
 
@@ -651,12 +851,85 @@ def _enrich_contexts_with_llm_summary(
                 llm_cache[key] = llm_summary_text
                 append_summary_cache(llm_cache_path, key, llm_summary_text)
             record["summary_fields"]["llm_summary_text"] = llm_summary_text
+            record["summary_fields"]["llm_summary_struct"] = parse_llm_summary_json(llm_summary_text)
             record["llm_context_text"] = _build_llm_context_text(llm_summary_text, record.get("main_context_text", ""))
             dst.write(json.dumps(record, ensure_ascii=False) + "\n")
             enriched_count += 1
 
     contexts_path.unlink(missing_ok=True)
     temp_path.replace(contexts_path)
+
+
+def _reranker_score_cache_key(user_id: str, target_t: int, target_pid: str, hist_pid: str) -> str:
+    return f"{user_id}\t{int(target_t)}\t{target_pid}\t{hist_pid}"
+
+
+def _append_reranker_cache_entries(cache_path: Path, entries: List[Tuple[str, float]]) -> None:
+    if not entries:
+        return
+    ensure_dir(cache_path.parent)
+    with cache_path.open("a", encoding="utf-8") as f:
+        for key, score in entries:
+            f.write(json.dumps({"key": key, "payload": {"score": float(score)}}, ensure_ascii=False) + "\n")
+
+
+def _apply_qwen_reranker(
+    *,
+    user_id: str,
+    target_t: int,
+    target_pid: str,
+    target_meta: Dict[str, Any],
+    stage1_candidates: List[Dict[str, Any]],
+    problem_catalog_records: Dict[str, Dict[str, Any]],
+    reranker: QwenReranker,
+    rerank_cache: Dict[str, Dict[str, Any]],
+    reranker_cache_path: Path,
+    rerank_weight: float,
+) -> None:
+    if not stage1_candidates:
+        return
+    query = (
+        f"目标题目: {str(target_meta.get('text') or '').strip()}\n"
+        f"目标知识点: {'、'.join(str(item) for item in target_meta.get('concepts') or [])}\n"
+        f"目标语义ID: {str(target_meta.get('semantic_id') or '').strip()}"
+    )
+    instruction = "Judge whether the historical problem is semantically useful evidence for predicting the target educational problem."
+    docs: List[str] = []
+    missing_indices: List[int] = []
+    missing_keys: List[str] = []
+    new_cache_entries: List[Tuple[str, float]] = []
+    for idx, candidate in enumerate(stage1_candidates):
+        hist_pid = str(candidate["problem_id"])
+        cache_key = _reranker_score_cache_key(user_id, target_t, target_pid, hist_pid)
+        payload = rerank_cache.get(cache_key)
+        if payload is not None:
+            candidate["raw_scores"]["rerank"] = float(payload["score"])
+            continue
+        hist_meta = problem_catalog_records[hist_pid]
+        docs.append(
+            f"历史题目: {str(hist_meta.get('text') or '').strip()}\n"
+            f"知识点: {'、'.join(str(item) for item in hist_meta.get('concepts') or [])}\n"
+            f"层级差: {candidate['level_diff']}\n"
+            f"历史结果: {candidate['answer_result']}\n"
+            f"知识重合: {'、'.join(candidate.get('knowledge_overlap_concepts') or []) or '无'}"
+        )
+        missing_indices.append(idx)
+        missing_keys.append(cache_key)
+
+    if docs:
+        scores = reranker.score(query=query, docs=docs, instruction=instruction)
+        if len(scores) != len(missing_indices):
+            raise ValueError("Reranker returned inconsistent score count")
+        for idx, cache_key, score in zip(missing_indices, missing_keys, scores):
+            stage1_candidates[idx]["raw_scores"]["rerank"] = float(score)
+            rerank_cache[cache_key] = {"score": float(score)}
+            new_cache_entries.append((cache_key, float(score)))
+    if new_cache_entries:
+        _append_reranker_cache_entries(reranker_cache_path, new_cache_entries)
+
+    for candidate in stage1_candidates:
+        rerank_score = float(candidate["raw_scores"].get("rerank", 0.0))
+        candidate["Ui"] = float(candidate["Ui"]) + float(rerank_weight) * rerank_score
 
 
 def _evidence_record(candidate: Dict[str, Any], rank: int, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -704,6 +977,13 @@ def run_stage34(
     preview_limit: int,
     dry_run: bool,
     smoke: bool,
+    text_embed_model: str = TEXT_EMBED_MODEL_NAME,
+    text_embed_batch_size: int = TEXT_EMBED_BATCH_SIZE,
+    text_rerank_model: str = TEXT_RERANK_MODEL_NAME,
+    text_rerank_batch_size: int = TEXT_RERANK_BATCH_SIZE,
+    use_qwen_reranker: bool = USE_QWEN_RERANKER,
+    rerank_topk: int = RERANK_TOPK,
+    rerank_weight: float = RERANK_WEIGHT,
     enable_llm_summary: bool = False,
     llm_base_url: Optional[str] = None,
     llm_model: Optional[str] = None,
@@ -712,10 +992,23 @@ def run_stage34(
     llm_max_tokens: int = 160,
     llm_temperature: float = 0.1,
     reuse_existing_contexts: bool = False,
+    context_shard_index: int = 0,
+    context_num_shards: int = 1,
+    merge_context_shards: bool = False,
 ) -> Stage34Result:
     ensure_dir(contexts_dir)
     ensure_dir(reports_dir)
     ensure_dir(cache_dir)
+    context_num_shards = int(context_num_shards)
+    context_shard_index = int(context_shard_index)
+    if context_num_shards <= 0:
+        raise ValueError("context_num_shards must be positive")
+    if context_shard_index < 0 or context_shard_index >= context_num_shards:
+        raise ValueError("context_shard_index must be in [0, context_num_shards)")
+    if merge_context_shards and context_num_shards <= 1:
+        raise ValueError("--merge_context_shards requires context_num_shards > 1")
+    if merge_context_shards and reuse_existing_contexts:
+        raise ValueError("--merge_context_shards cannot be combined with --reuse_existing_contexts")
 
     problem_catalog_records: Dict[str, Dict[str, Any]] = {}
     with (priors_dir / "problem_catalog.jsonl").open("r", encoding="utf-8") as f:
@@ -725,10 +1018,35 @@ def run_stage34(
             record = json.loads(line)
             problem_catalog_records[str(record["problem_id"])] = record
 
-    contexts_path = contexts_dir / "contexts.jsonl"
-    preview_path = reports_dir / "context_preview.txt"
+    shard_mode = context_num_shards > 1 and not merge_context_shards
+    shard_dir = ensure_dir(contexts_dir / "shards")
+    report_shard_dir = ensure_dir(reports_dir / "shards")
+    if shard_mode:
+        suffix = _shard_suffix(context_shard_index, context_num_shards)
+        contexts_path = shard_dir / f"contexts.{suffix}.jsonl"
+        preview_path = report_shard_dir / f"context_preview.{suffix}.txt"
+        manifest_path = shard_dir / f"stage34_manifest.{suffix}.json"
+    else:
+        contexts_path = contexts_dir / "contexts.jsonl"
+        preview_path = reports_dir / "context_preview.txt"
+        manifest_path = contexts_dir / "stage34_manifest.json"
     device = pick_device()
+    reranker: Optional[QwenReranker] = None
+    reranker_cache_path = (
+        cache_dir / f"reranker_cache.{_shard_suffix(context_shard_index, context_num_shards)}.jsonl"
+        if shard_mode
+        else cache_dir / "reranker_cache.jsonl"
+    )
+    rerank_cache: Dict[str, Dict[str, Any]] = {}
     summarizer: Optional[OpenAICompatibleSummarizer] = None
+    if use_qwen_reranker and not reuse_existing_contexts and not merge_context_shards:
+        reranker = QwenReranker(
+            model_name_or_path=str(text_rerank_model or TEXT_RERANK_MODEL_NAME),
+            device=device,
+            max_length=TEXT_RERANK_MAX_LENGTH,
+            batch_size=int(text_rerank_batch_size),
+        )
+        rerank_cache = load_json_cache(reranker_cache_path)
     if enable_llm_summary:
         summarizer = OpenAICompatibleSummarizer(
             base_url=str(llm_base_url or ""),
@@ -738,6 +1056,53 @@ def run_stage34(
             max_tokens=int(llm_max_tokens),
             temperature=float(llm_temperature),
         )
+
+    if merge_context_shards:
+        record_count = _merge_context_shards(
+            contexts_dir=contexts_dir,
+            reports_dir=reports_dir,
+            shard_count=context_num_shards,
+            preview_limit=preview_limit,
+            output_contexts_path=contexts_path,
+            output_preview_path=preview_path,
+        )
+        index_records, _ = _load_index_records_from_contexts(contexts_path)
+        if summarizer is not None:
+            _enrich_contexts_with_llm_summary(
+                contexts_path=contexts_path,
+                cache_dir=cache_dir,
+                problem_catalog_records=problem_catalog_records,
+                summarizer=summarizer,
+            )
+        embeddings_path: Optional[Path] = None
+        if not dry_run:
+            embeddings_path = _build_context_embeddings(
+                contexts_path=contexts_path,
+                cache_dir=cache_dir,
+                device=device,
+                text_embed_model=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
+                text_embed_batch_size=int(text_embed_batch_size),
+            )
+        result = Stage34Result(
+            contexts_path=str(contexts_path),
+            preview_path=str(preview_path),
+            embeddings_path=str(embeddings_path) if embeddings_path is not None else None,
+            manifest_path=str(manifest_path),
+            record_count=record_count,
+            text_embed_model=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
+            text_embed_batch_size=int(text_embed_batch_size),
+            text_rerank_model=str(text_rerank_model or TEXT_RERANK_MODEL_NAME),
+            text_rerank_batch_size=int(text_rerank_batch_size),
+            use_qwen_reranker=bool(use_qwen_reranker),
+            rerank_topk=int(rerank_topk),
+            rerank_weight=float(rerank_weight),
+            reranker_cache_path=None,
+            context_shard_index=context_shard_index,
+            context_num_shards=context_num_shards,
+            merge_context_shards=True,
+        )
+        write_json(asdict(result), Path(result.manifest_path))
+        return result
 
     if reuse_existing_contexts:
         if not contexts_path.exists():
@@ -751,6 +1116,10 @@ def run_stage34(
             allowed_problem_ids = set(problem_catalog_records.keys())
             problem_records = [problem for problem in problem_records if problem.problem_id in allowed_problem_ids]
             student_sequences = student_sequences[:128]
+        if context_num_shards > 1:
+            student_sequences = [
+                student for idx, student in enumerate(student_sequences) if idx % context_num_shards == context_shard_index
+            ]
 
         with (priors_dir / "semantic_vectors.pkl").open("rb") as f:
             eqsem_map = pickle.load(f)
@@ -831,7 +1200,20 @@ def run_stage34(
                         candidates.append(candidate)
 
                     candidates.sort(key=lambda item: (item["Ri"], item["history_pos"]), reverse=True)
-                    stage1_candidates = candidates[: min(K1_DEFAULT, len(candidates))]
+                    stage1_candidates = candidates[: min(int(rerank_topk), K1_DEFAULT, len(candidates))]
+                    if reranker is not None and stage1_candidates:
+                        _apply_qwen_reranker(
+                            user_id=student.user_id,
+                            target_t=target_t,
+                            target_pid=target_pid,
+                            target_meta=problem_catalog_records[target_pid],
+                            stage1_candidates=stage1_candidates,
+                            problem_catalog_records=problem_catalog_records,
+                            reranker=reranker,
+                            rerank_cache=rerank_cache,
+                            reranker_cache_path=reranker_cache_path,
+                            rerank_weight=float(rerank_weight),
+                        )
 
                     selected: List[Dict[str, Any]] = []
                     remaining = list(stage1_candidates)
@@ -906,14 +1288,27 @@ def run_stage34(
             contexts_path=contexts_path,
             cache_dir=cache_dir,
             device=device,
+            text_embed_model=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
+            text_embed_batch_size=int(text_embed_batch_size),
         )
 
-    result = Stage34Result(
+        result = Stage34Result(
         contexts_path=str(contexts_path),
         preview_path=str(preview_path),
         embeddings_path=str(embeddings_path) if embeddings_path is not None else None,
-        manifest_path=str(contexts_dir / "stage34_manifest.json"),
+        manifest_path=str(manifest_path),
         record_count=record_count,
+        text_embed_model=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
+        text_rerank_model=str(text_rerank_model or TEXT_RERANK_MODEL_NAME),
+        use_qwen_reranker=bool(use_qwen_reranker),
+        rerank_topk=int(rerank_topk),
+        rerank_weight=float(rerank_weight),
+        reranker_cache_path=str(reranker_cache_path.resolve()) if use_qwen_reranker else None,
+        text_embed_batch_size=int(text_embed_batch_size),
+        text_rerank_batch_size=int(text_rerank_batch_size),
+        context_shard_index=context_shard_index,
+        context_num_shards=context_num_shards,
+        merge_context_shards=False,
     )
     write_json(asdict(result), Path(result.manifest_path))
     return result

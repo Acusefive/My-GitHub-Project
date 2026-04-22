@@ -5,9 +5,12 @@ from pathlib import Path
 
 from common_pipeline_strict.constants import (
     DEFAULT_OUT_ROOT,
+    LLM_SUMMARY_CHUNK_SIZE,
+    LLM_SUMMARY_WORKERS,
     RERANK_TOPK,
     RERANK_WEIGHT,
     TEXT_EMBED_BATCH_SIZE,
+    TEXT_EMBED_MAX_LENGTH,
     TEXT_EMBED_MODEL_NAME,
     TEXT_RERANK_BATCH_SIZE,
     TEXT_RERANK_MODEL_NAME,
@@ -33,6 +36,7 @@ def main() -> None:
     parser.add_argument("--skip_stage32", action="store_true")
     parser.add_argument("--text_embed_model", type=str, default=TEXT_EMBED_MODEL_NAME)
     parser.add_argument("--text_embed_batch_size", type=int, default=TEXT_EMBED_BATCH_SIZE)
+    parser.add_argument("--text_embed_max_length", type=int, default=TEXT_EMBED_MAX_LENGTH)
     parser.add_argument("--text_rerank_model", type=str, default=TEXT_RERANK_MODEL_NAME)
     parser.add_argument("--text_rerank_batch_size", type=int, default=TEXT_RERANK_BATCH_SIZE)
     parser.add_argument("--use_qwen_reranker", action="store_true", default=USE_QWEN_RERANKER)
@@ -48,6 +52,8 @@ def main() -> None:
     parser.add_argument("--llm_timeout_sec", type=int, default=120)
     parser.add_argument("--llm_max_tokens", type=int, default=160)
     parser.add_argument("--llm_temperature", type=float, default=0.1)
+    parser.add_argument("--llm_summary_workers", type=int, default=LLM_SUMMARY_WORKERS)
+    parser.add_argument("--llm_summary_chunk_size", type=int, default=LLM_SUMMARY_CHUNK_SIZE)
     parser.add_argument("--context_shard_index", type=int, default=0)
     parser.add_argument("--context_num_shards", type=int, default=1)
     parser.add_argument("--merge_context_shards", action="store_true")
@@ -73,6 +79,7 @@ def main() -> None:
             smoke=bool(args.smoke),
             text_embed_model=str(args.text_embed_model),
             text_embed_batch_size=int(args.text_embed_batch_size),
+            text_embed_max_length=int(args.text_embed_max_length),
             enable_llm_graph_completion=bool(args.enable_llm_graph_completion),
             llm_base_url=str(args.llm_base_url),
             llm_model=str(args.llm_model),
@@ -93,6 +100,7 @@ def main() -> None:
         smoke=bool(args.smoke),
         text_embed_model=str(args.text_embed_model),
         text_embed_batch_size=int(args.text_embed_batch_size),
+        text_embed_max_length=int(args.text_embed_max_length),
         text_rerank_model=str(args.text_rerank_model),
         text_rerank_batch_size=int(args.text_rerank_batch_size),
         use_qwen_reranker=bool(args.use_qwen_reranker and not args.disable_qwen_reranker),
@@ -105,6 +113,8 @@ def main() -> None:
         llm_timeout_sec=int(args.llm_timeout_sec),
         llm_max_tokens=int(args.llm_max_tokens),
         llm_temperature=float(args.llm_temperature),
+        llm_summary_workers=int(args.llm_summary_workers),
+        llm_summary_chunk_size=int(args.llm_summary_chunk_size),
         reuse_existing_contexts=bool(args.reuse_existing_contexts),
         context_shard_index=int(args.context_shard_index),
         context_num_shards=int(args.context_num_shards),

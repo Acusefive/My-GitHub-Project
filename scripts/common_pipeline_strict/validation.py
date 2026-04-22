@@ -4,7 +4,7 @@ import json
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -24,7 +24,7 @@ class ValidationResult:
 
 def _load_jsonl(path: Path, limit: Optional[int] = None) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
             if not line.strip():
                 continue
@@ -61,7 +61,6 @@ def run_validation(
     with (priors_dir / "hqtext_vectors.pkl").open("rb") as f:
         hqtext_map = pickle.load(f)
 
-    # semantic id determinism on saved hqtext vectors
     recompute_problems = [
         ProblemRecord(
             problem_id=str(record["problem_id"]),
@@ -85,7 +84,6 @@ def run_validation(
     if not semantic_ids_stable:
         failures.append("semantic_ids_not_stable")
 
-    # stage 3.2 checks
     if len(semantic_ids) != len(problem_catalog):
         failures.append("semantic_id_coverage_mismatch")
     if len(problem_mu_q) != len(problem_catalog):
@@ -96,27 +94,39 @@ def run_validation(
         failures.append("text_embed_model_mismatch_between_stage32_stage34")
     if int(defaults.get("text_embed_batch_size") or 0) <= 0:
         failures.append("text_embed_batch_size_invalid")
+    if int(defaults.get("text_embed_max_length") or 0) <= 0:
+        failures.append("text_embed_max_length_invalid")
+    if int(stage34_manifest.get("text_embed_max_length") or 0) != int(defaults.get("text_embed_max_length") or 0):
+        failures.append("text_embed_max_length_mismatch_between_stage32_stage34")
     if defaults.get("kglobal") != 50 or defaults.get("klocal") != 5:
         failures.append("semantic_id_defaults_mismatch")
     if defaults.get("ctfidf_max_features") != 5000:
         failures.append("ctfidf_default_mismatch")
+
     if defaults.get("use_rasch_enhancement"):
         mu_values = np.asarray([float(problem_mu_q.get(str(record["problem_id"]), 0.0)) for record in problem_catalog], dtype=np.float32)
         if not np.all(np.isfinite(mu_values)):
             failures.append("problem_mu_q_not_finite")
         elif np.max(np.abs(mu_values)) <= 1e-8:
             failures.append("problem_mu_q_all_zero")
+
     if defaults.get("enable_llm_graph_completion"):
         llm_graph_completion = graph_bundle.get("llm_graph_completion")
         if not llm_graph_completion:
             failures.append("graph_completion_missing")
         else:
             allowed_confidence = {"低", "中", "高"}
+            required_graph_keys = {"prerequisite_candidates", "related_candidates", "confidence"}
+            optional_graph_keys = {"chapters", "candidate_concepts"}
             for concept, payload in llm_graph_completion.items():
                 if not isinstance(payload, dict):
                     failures.append(f"graph_completion_payload_invalid:{concept}")
                     break
-                if set(payload.keys()) != {"prerequisite_candidates", "related_candidates", "confidence"}:
+                payload_keys = set(payload.keys())
+                if not required_graph_keys.issubset(payload_keys):
+                    failures.append(f"graph_completion_schema_invalid:{concept}")
+                    break
+                if not payload_keys.issubset(required_graph_keys | optional_graph_keys):
                     failures.append(f"graph_completion_schema_invalid:{concept}")
                     break
                 prereq = payload.get("prerequisite_candidates")
@@ -129,10 +139,11 @@ def run_validation(
                     failures.append(f"graph_completion_confidence_invalid:{concept}")
                     break
     else:
-        if not graph_bundle.get("has_explicit_prerequisite") is False:
+        if graph_bundle.get("has_explicit_prerequisite") is not False:
             failures.append("graph_has_unexpected_prerequisite")
         if graph_bundle.get("e_pre") != []:
             failures.append("graph_prerequisite_not_empty")
+
     if not training_report.get("history"):
         failures.append("training_history_missing")
     else:
@@ -140,10 +151,10 @@ def run_validation(
         if min(val_losses) > val_losses[0] + 1e-8:
             failures.append("training_val_not_improved")
 
-    # stage 3.3 / 3.4 checks
     non_time_sorted_records = 0
     llm_summary_present = 0
     llm_summary_struct_valid = 0
+    context_stage_failed = False
     for record in contexts:
         target_t = int(record["target_t"])
         candidate_count = int(record["stage1_candidate_count"])
@@ -151,16 +162,21 @@ def run_validation(
         stage1_limit = int(stage34_manifest.get("rerank_topk") or K1_DEFAULT)
         if candidate_count != min(stage1_limit, K1_DEFAULT, target_t):
             failures.append(f"stage1_count_invalid:{record['user_id']}:{target_t}")
+            context_stage_failed = True
             break
         if selected_count != min(K2_DEFAULT, candidate_count):
             failures.append(f"stage2_count_invalid:{record['user_id']}:{target_t}")
+            context_stage_failed = True
             break
         if "[GLOBAL SUMMARY]" in str(record["main_context_text"]):
             failures.append(f"main_contains_summary_header:{record['user_id']}:{target_t}")
+            context_stage_failed = True
             break
         if record["summary_fields"]["summary_text"] not in str(record["template_context_text"]):
             failures.append(f"template_missing_summary_text:{record['user_id']}:{target_t}")
+            context_stage_failed = True
             break
+
         llm_summary_text = str(record.get("summary_fields", {}).get("llm_summary_text") or "").strip()
         llm_summary_struct = record.get("summary_fields", {}).get("llm_summary_struct")
         llm_context_text = str(record.get("llm_context_text") or "").strip()
@@ -170,12 +186,15 @@ def run_validation(
                 parsed_llm_struct = parse_llm_summary_json(llm_summary_text)
             except Exception:
                 failures.append(f"llm_summary_json_invalid:{record['user_id']}:{target_t}")
+                context_stage_failed = True
                 break
             if llm_summary_struct != parsed_llm_struct:
                 failures.append(f"llm_summary_struct_mismatch:{record['user_id']}:{target_t}")
+                context_stage_failed = True
                 break
             if not llm_context_text:
                 failures.append(f"llm_context_missing:{record['user_id']}:{target_t}")
+                context_stage_failed = True
                 break
             llm_summary_struct_valid += 1
 
@@ -183,28 +202,34 @@ def run_validation(
         for idx, evidence in enumerate(record["evidence_list"], start=1):
             if int(evidence["rank"]) != idx:
                 failures.append(f"evidence_rank_invalid:{record['user_id']}:{target_t}")
+                context_stage_failed = True
                 break
             if str(evidence["role"]) not in set(ROLE_LABELS.values()):
                 failures.append(f"evidence_role_invalid:{record['user_id']}:{target_t}")
+                context_stage_failed = True
                 break
             if stage34_manifest.get("use_qwen_reranker"):
                 raw_scores = evidence.get("raw_scores") or {}
                 if "rerank" not in raw_scores:
                     failures.append(f"rerank_score_missing:{record['user_id']}:{target_t}")
+                    context_stage_failed = True
                     break
             support_score = str(evidence["support_score"])
             if "." not in support_score or len(support_score.rsplit(".", 1)[1]) != SUPPORT_SCORE_DECIMALS:
                 failures.append(f"support_score_precision_invalid:{record['user_id']}:{target_t}")
+                context_stage_failed = True
                 break
             q_text = str(evidence["question_text"])
             if len(q_text) > QUESTION_TEXT_LIMIT + len(QUESTION_TEXT_ELLIPSIS):
                 failures.append(f"question_text_too_long:{record['user_id']}:{target_t}")
+                context_stage_failed = True
                 break
             if len(q_text) > QUESTION_TEXT_LIMIT and not q_text.endswith(QUESTION_TEXT_ELLIPSIS):
                 failures.append(f"question_text_missing_ellipsis:{record['user_id']}:{target_t}")
+                context_stage_failed = True
                 break
             history_positions.append(int(evidence["history_pos"]))
-        if failures:
+        if context_stage_failed:
             break
         if history_positions != sorted(history_positions):
             non_time_sorted_records += 1
@@ -241,6 +266,7 @@ def run_validation(
             llm_embedding_checks["llm_struct_features_shape"] = llm_struct_feature_shape
             if llm_struct_feature_shape[0] != index_len:
                 failures.append("llm_struct_features_count_mismatch")
+
     reranker_checks: Dict[str, Any] = {
         "enabled": bool(stage34_manifest.get("use_qwen_reranker")),
         "text_rerank_model": stage34_manifest.get("text_rerank_model"),
@@ -261,7 +287,8 @@ def run_validation(
             failures.append("reranker_cache_missing")
         else:
             reranker_checks["reranker_cache_exists"] = True
-    if llm_summary_present > 0:
+
+    if llm_summary_present > 0 and not context_stage_failed:
         if llm_summary_present != len(contexts):
             failures.append("llm_summary_partial_coverage")
         if llm_summary_struct_valid != len(contexts):
@@ -295,7 +322,9 @@ def run_validation(
         "retrieval_checks": {
             "text_embed_model_name": defaults.get("text_embed_model_name"),
             "text_embed_batch_size": defaults.get("text_embed_batch_size"),
+            "text_embed_max_length": defaults.get("text_embed_max_length"),
             "stage34_text_embed_model_name": stage34_manifest.get("text_embed_model"),
+            "stage34_text_embed_max_length": stage34_manifest.get("text_embed_max_length"),
             "text_rerank_model_name": stage34_manifest.get("text_rerank_model"),
             "text_rerank_batch_size": stage34_manifest.get("text_rerank_batch_size"),
             "use_qwen_reranker": bool(stage34_manifest.get("use_qwen_reranker")),

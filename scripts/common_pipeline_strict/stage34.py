@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
 import pickle
@@ -24,6 +25,8 @@ from .constants import (
     HISTORY_WINDOW,
     K1_DEFAULT,
     K2_DEFAULT,
+    LLM_SUMMARY_CHUNK_SIZE,
+    LLM_SUMMARY_WORKERS,
     LAMBDA_COV,
     LAMBDA_RED,
     QUESTION_TEXT_ELLIPSIS,
@@ -59,7 +62,7 @@ from .io_utils import (
 )
 from .llm_utils import (
     OpenAICompatibleSummarizer,
-    append_summary_cache,
+    append_summary_cache_entries,
     load_json_cache,
     load_summary_cache,
     parse_llm_summary_json,
@@ -78,12 +81,15 @@ class Stage34Result:
     record_count: int
     text_embed_model: str
     text_embed_batch_size: int
+    text_embed_max_length: int
     text_rerank_model: str
     text_rerank_batch_size: int
     use_qwen_reranker: bool
     rerank_topk: int
     rerank_weight: float
     reranker_cache_path: Optional[str]
+    llm_summary_workers: int
+    llm_summary_chunk_size: int
     context_shard_index: int
     context_num_shards: int
     merge_context_shards: bool
@@ -637,6 +643,47 @@ def _build_llm_struct_feature_vector(record: Dict[str, Any]) -> np.ndarray:
     return features
 
 
+def _unique_texts_with_inverse(texts: Sequence[str]) -> Tuple[List[str], np.ndarray]:
+    unique_texts: List[str] = []
+    inverse_indices = np.zeros((len(texts),), dtype=np.int64)
+    text_to_unique_idx: Dict[str, int] = {}
+    for idx, text in enumerate(texts):
+        normalized = str(text or "")
+        unique_idx = text_to_unique_idx.get(normalized)
+        if unique_idx is None:
+            unique_idx = len(unique_texts)
+            unique_texts.append(normalized)
+            text_to_unique_idx[normalized] = unique_idx
+        inverse_indices[idx] = unique_idx
+    return unique_texts, inverse_indices
+
+
+def _encode_dedup_texts_resumable(
+    *,
+    encoder: QwenEmbeddingEncoder,
+    texts: Sequence[str],
+    instruction: str,
+    desc: str,
+    cache_prefix: Path,
+) -> np.ndarray:
+    unique_texts, inverse_indices = _unique_texts_with_inverse(texts)
+    total_count = len(texts)
+    unique_count = len(unique_texts)
+    reuse_ratio = 1.0 - (float(unique_count) / float(total_count)) if total_count > 0 else 0.0
+    print(
+        f"[stage34] {desc}: total={total_count}, unique={unique_count}, reuse_ratio={reuse_ratio:.2%}",
+        flush=True,
+    )
+    unique_embeddings = encoder.encode_texts_resumable(
+        unique_texts,
+        instruction=instruction,
+        desc=desc,
+        cache_prefix=cache_prefix,
+    )
+    unique_embeddings = np.asarray(unique_embeddings, dtype=np.float32)
+    return unique_embeddings[inverse_indices]
+
+
 def _load_index_records_from_contexts(contexts_path: Path) -> Tuple[List[Dict[str, Any]], int]:
     index_records: List[Dict[str, Any]] = []
     record_count = 0
@@ -670,30 +717,28 @@ def _merge_context_shards(
     output_preview_path: Path,
 ) -> int:
     shard_dir = contexts_dir / "shards"
-    records: List[Dict[str, Any]] = []
-    for shard_index in range(int(shard_count)):
-        shard_path = shard_dir / f"contexts.{_shard_suffix(shard_index, shard_count)}.jsonl"
-        if not shard_path.exists():
-            raise FileNotFoundError(f"Missing shard contexts file: {shard_path}")
-        with shard_path.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                records.append(json.loads(line))
-    records.sort(key=lambda item: (str(item["user_id"]), int(item["target_t"]), str(item["target_pid"])))
-    with output_contexts_path.open("w", encoding="utf-8") as f:
-        for record in records:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
+    record_count = 0
     preview_lines: List[str] = []
-    for record in records[: max(0, int(preview_limit))]:
-        preview_lines.append(
-            f"--- {record['user_id']} @ t={int(record['target_t'])} / {record['target_pid']} ---\n"
-            f"[MAIN]\n{str(record.get('main_context_text') or '').strip()}\n\n"
-            f"[TEMPLATE]\n{str(record.get('template_context_text') or '').strip()}\n"
-        )
+    with output_contexts_path.open("w", encoding="utf-8") as dst:
+        for shard_index in range(int(shard_count)):
+            shard_path = shard_dir / f"contexts.{_shard_suffix(shard_index, shard_count)}.jsonl"
+            if not shard_path.exists():
+                raise FileNotFoundError(f"Missing shard contexts file: {shard_path}")
+            with shard_path.open("r", encoding="utf-8", errors="replace") as src:
+                for line in tqdm(src, desc=f"merge shard {shard_index + 1}/{int(shard_count)}"):
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    dst.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    if len(preview_lines) < max(0, int(preview_limit)):
+                        preview_lines.append(
+                            f"--- {record['user_id']} @ t={int(record['target_t'])} / {record['target_pid']} ---\n"
+                            f"[MAIN]\n{str(record.get('main_context_text') or '').strip()}\n\n"
+                            f"[TEMPLATE]\n{str(record.get('template_context_text') or '').strip()}\n"
+                        )
+                    record_count += 1
     atomic_save_text("\n\n".join(preview_lines), output_preview_path)
-    return len(records)
+    return record_count
 
 
 def _build_context_embeddings(
@@ -703,13 +748,17 @@ def _build_context_embeddings(
     device: str,
     text_embed_model: str,
     text_embed_batch_size: int,
+    text_embed_max_length: int,
 ) -> Path:
+    print("[stage34] loading text embedding model for context embeddings", flush=True)
     encoder = QwenEmbeddingEncoder(
         model_name_or_path=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
         device=device,
-        max_length=TEXT_EMBED_MAX_LENGTH,
+        max_length=int(text_embed_max_length),
         batch_size=int(text_embed_batch_size),
     )
+    parts_dir = ensure_dir(cache_dir / "context_embedding_parts")
+    print("[stage34] scanning contexts for embedding inputs", flush=True)
     index_records, _record_count = _load_index_records_from_contexts(contexts_path)
     main_texts: List[str] = []
     template_texts: List[str] = []
@@ -747,40 +796,68 @@ def _build_context_embeddings(
                 struct_summary_texts.append("")
                 aux_texts.append("")
                 struct_feature_rows.append(np.zeros((11,), dtype=np.float32))
-    main_embeddings = encoder.encode_texts(
-        main_texts,
+    print(f"[stage34] encoding main context texts ({len(main_texts)})", flush=True)
+    main_embeddings = _encode_dedup_texts_resumable(
+        encoder=encoder,
+        texts=main_texts,
         instruction="Encode retrieved educational evidence context for downstream knowledge tracing.",
+        desc="strict main embeddings",
+        cache_prefix=parts_dir / "main_embeddings_unique",
     )
-    template_embeddings = encoder.encode_texts(
-        template_texts,
+    print(f"[stage34] encoding template context texts ({len(template_texts)})", flush=True)
+    template_embeddings = _encode_dedup_texts_resumable(
+        encoder=encoder,
+        texts=template_texts,
         instruction="Encode summary-augmented educational evidence context for downstream knowledge tracing.",
+        desc="strict template embeddings",
+        cache_prefix=parts_dir / "template_embeddings_unique",
     )
     llm_embeddings = None
     if has_any_llm_summary:
         if not all(text.strip() for text in llm_texts):
             raise ValueError("LLM summaries are partially missing; strict full-system mode requires full llm coverage")
-        llm_embeddings = encoder.encode_texts(
-            llm_texts,
+        print(f"[stage34] encoding llm context texts ({len(llm_texts)})", flush=True)
+        llm_embeddings = _encode_dedup_texts_resumable(
+            encoder=encoder,
+            texts=llm_texts,
             instruction="Encode LLM-enhanced cognitive context for downstream knowledge tracing.",
+            desc="strict llm embeddings",
+            cache_prefix=parts_dir / "llm_embeddings_unique",
         )
     llm_struct_embeddings = None
     llm_struct_features = None
     if has_any_llm_summary:
-        stable_embeddings = encoder.encode_texts(
-            stable_texts,
+        print(f"[stage34] encoding llm stable point texts ({len(stable_texts)})", flush=True)
+        stable_embeddings = _encode_dedup_texts_resumable(
+            encoder=encoder,
+            texts=stable_texts,
             instruction="Encode stable cognitive mastery points extracted from LLM structured summaries.",
+            desc="strict llm stable embeddings",
+            cache_prefix=parts_dir / "llm_stable_embeddings_unique",
         )
-        weak_embeddings = encoder.encode_texts(
-            weak_texts,
+        print(f"[stage34] encoding llm weak point texts ({len(weak_texts)})", flush=True)
+        weak_embeddings = _encode_dedup_texts_resumable(
+            encoder=encoder,
+            texts=weak_texts,
             instruction="Encode weak cognitive points extracted from LLM structured summaries.",
+            desc="strict llm weak embeddings",
+            cache_prefix=parts_dir / "llm_weak_embeddings_unique",
         )
-        summary_embeddings = encoder.encode_texts(
-            struct_summary_texts,
+        print(f"[stage34] encoding llm summary texts ({len(struct_summary_texts)})", flush=True)
+        summary_embeddings = _encode_dedup_texts_resumable(
+            encoder=encoder,
+            texts=struct_summary_texts,
             instruction="Encode concise cognitive state summaries extracted from LLM structured summaries.",
+            desc="strict llm summary embeddings",
+            cache_prefix=parts_dir / "llm_summary_embeddings_unique",
         )
-        aux_embeddings = encoder.encode_texts(
-            aux_texts,
+        print(f"[stage34] encoding llm aux texts ({len(aux_texts)})", flush=True)
+        aux_embeddings = _encode_dedup_texts_resumable(
+            encoder=encoder,
+            texts=aux_texts,
             instruction="Encode volatility and confidence descriptors extracted from LLM structured summaries.",
+            desc="strict llm aux embeddings",
+            cache_prefix=parts_dir / "llm_aux_embeddings_unique",
         )
         llm_struct_embeddings = np.concatenate(
             [
@@ -792,11 +869,14 @@ def _build_context_embeddings(
             axis=1,
         ).astype(np.float32)
         llm_struct_features = np.stack(struct_feature_rows, axis=0).astype(np.float32)
+        print("[stage34] built llm_struct_embeddings and llm_struct_features", flush=True)
     main_embeddings = np.asarray(main_embeddings, dtype=np.float32)
     template_embeddings = np.asarray(template_embeddings, dtype=np.float32)
     if llm_embeddings is not None:
         llm_embeddings = np.asarray(llm_embeddings, dtype=np.float32)
     embeddings_path = cache_dir / "context_embeddings.pkl"
+    print(f"[stage34] embedding stage checkpoints are stored under {parts_dir}", flush=True)
+    print(f"[stage34] writing context embeddings to {embeddings_path}", flush=True)
     with embeddings_path.open("wb") as f:
         payload = {
             "index": index_records,
@@ -819,45 +899,156 @@ def _enrich_contexts_with_llm_summary(
     cache_dir: Path,
     problem_catalog_records: Dict[str, Dict[str, Any]],
     summarizer: OpenAICompatibleSummarizer,
+    llm_summary_workers: int,
+    llm_summary_chunk_size: int,
 ) -> None:
+    def _summarize_record(record: Dict[str, Any]) -> str:
+        target_pid = str(record["target_pid"])
+        target_meta = problem_catalog_records[target_pid]
+        return summarizer.summarize(
+            target_pid=target_pid,
+            target_question_text=str(target_meta["text"]),
+            target_semantic_id=str(record.get("target_semantic_id") or target_meta["semantic_id"]),
+            target_concepts=record.get("summary_fields", {}).get("target_concepts") or target_meta["concepts"],
+            evidence_list=record.get("evidence_list") or [],
+            template_summary_text=str(record.get("summary_fields", {}).get("summary_text") or ""),
+        )
+
     llm_cache_path = cache_dir / "llm_summary_cache.jsonl"
+    llm_failure_path = cache_dir / "llm_summary_failures.jsonl"
     llm_cache = load_summary_cache(llm_cache_path)
     temp_path = contexts_path.with_suffix(".llm.tmp")
+    workers = max(1, int(llm_summary_workers))
+    chunk_size = max(workers, int(llm_summary_chunk_size))
     total_records = 0
     with contexts_path.open("r", encoding="utf-8", errors="replace") as probe_f:
         for line in probe_f:
             if line.strip():
                 total_records += 1
 
-    enriched_count = 0
-    with contexts_path.open("r", encoding="utf-8", errors="replace") as src, temp_path.open("w", encoding="utf-8") as dst:
-        for line in tqdm(src, desc="strict llm summaries", total=total_records):
-            if not line.strip():
-                continue
-            record = json.loads(line)
+    failures: List[Dict[str, Any]] = []
+
+    def _rewrite_summary_cache() -> None:
+        temp_cache_path = llm_cache_path.with_suffix(".rewrite.tmp")
+        with temp_cache_path.open("w", encoding="utf-8") as f:
+            for key, summary_text in llm_cache.items():
+                f.write(json.dumps({"key": key, "summary_text": summary_text}, ensure_ascii=False) + "\n")
+        temp_cache_path.replace(llm_cache_path)
+
+    def _record_failure(record: Dict[str, Any], *, key: str, exc: Exception) -> None:
+        failures.append(
+            {
+                "key": key,
+                "user_id": str(record.get("user_id") or ""),
+                "target_t": int(record.get("target_t") or 0),
+                "target_pid": str(record.get("target_pid") or ""),
+                "target_semantic_id": str(record.get("target_semantic_id") or ""),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+
+    def _flush_chunk(chunk_records: List[Dict[str, Any]], dst: Any, executor: Optional[ThreadPoolExecutor]) -> None:
+        if not chunk_records:
+            return
+        missing_items: List[Tuple[int, str, Dict[str, Any]]] = []
+        new_cache_entries: List[Tuple[str, str]] = []
+        for idx, record in enumerate(chunk_records):
             key = summary_cache_key(record["user_id"], int(record["target_t"]), record["target_pid"])
             llm_summary_text = llm_cache.get(key, "").strip()
+            record["_llm_key"] = key
+            if llm_summary_text:
+                record["_llm_summary_text"] = llm_summary_text
+            else:
+                missing_items.append((idx, key, record))
+
+        if missing_items:
+            if executor is None or len(missing_items) == 1:
+                for idx, key, record in missing_items:
+                    try:
+                        llm_summary_text = _summarize_record(record)
+                    except Exception as exc:
+                        _record_failure(record, key=key, exc=exc)
+                        continue
+                    record["_llm_summary_text"] = llm_summary_text
+                    llm_cache[key] = llm_summary_text
+                    new_cache_entries.append((key, llm_summary_text))
+            else:
+                future_map = {
+                    executor.submit(_summarize_record, record): (idx, key, record)
+                    for idx, key, record in missing_items
+                }
+                for future in as_completed(future_map):
+                    idx, key, record = future_map[future]
+                    try:
+                        llm_summary_text = future.result()
+                    except Exception as exc:
+                        _record_failure(record, key=key, exc=exc)
+                        continue
+                    record["_llm_summary_text"] = llm_summary_text
+                    llm_cache[key] = llm_summary_text
+                    new_cache_entries.append((key, llm_summary_text))
+
+        if new_cache_entries:
+            append_summary_cache_entries(llm_cache_path, new_cache_entries)
+
+        for record in chunk_records:
+            key = str(record.pop("_llm_key"))
+            llm_summary_text = str(record.pop("_llm_summary_text", "") or "")
             if not llm_summary_text:
-                target_pid = str(record["target_pid"])
-                target_meta = problem_catalog_records[target_pid]
-                llm_summary_text = summarizer.summarize(
-                    target_pid=target_pid,
-                    target_question_text=str(target_meta["text"]),
-                    target_semantic_id=str(record.get("target_semantic_id") or target_meta["semantic_id"]),
-                    target_concepts=record.get("summary_fields", {}).get("target_concepts") or target_meta["concepts"],
-                    evidence_list=record.get("evidence_list") or [],
-                    template_summary_text=str(record.get("summary_fields", {}).get("summary_text") or ""),
-                )
-                llm_cache[key] = llm_summary_text
-                append_summary_cache(llm_cache_path, key, llm_summary_text)
+                dst.write(json.dumps(record, ensure_ascii=False) + "\n")
+                continue
             record["summary_fields"]["llm_summary_text"] = llm_summary_text
-            record["summary_fields"]["llm_summary_struct"] = parse_llm_summary_json(llm_summary_text)
+            try:
+                record["summary_fields"]["llm_summary_struct"] = parse_llm_summary_json(llm_summary_text)
+            except Exception as exc:
+                llm_cache.pop(key, None)
+                _record_failure(record, key=key, exc=exc)
+                record["summary_fields"].pop("llm_summary_text", None)
+                record["summary_fields"].pop("llm_summary_struct", None)
+                dst.write(json.dumps(record, ensure_ascii=False) + "\n")
+                continue
             record["llm_context_text"] = _build_llm_context_text(llm_summary_text, record.get("main_context_text", ""))
             dst.write(json.dumps(record, ensure_ascii=False) + "\n")
-            enriched_count += 1
+
+    executor: Optional[ThreadPoolExecutor] = None
+    if workers > 1:
+        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="llm-summary")
+    try:
+        with contexts_path.open("r", encoding="utf-8", errors="replace") as src, temp_path.open("w", encoding="utf-8") as dst:
+            chunk_records: List[Dict[str, Any]] = []
+            progress = tqdm(total=total_records, desc="strict llm summaries")
+            try:
+                for line in src:
+                    if not line.strip():
+                        continue
+                    chunk_records.append(json.loads(line))
+                    if len(chunk_records) >= chunk_size:
+                        processed = len(chunk_records)
+                        _flush_chunk(chunk_records, dst, executor)
+                        progress.update(processed)
+                        chunk_records = []
+                if chunk_records:
+                    processed = len(chunk_records)
+                    _flush_chunk(chunk_records, dst, executor)
+                    progress.update(processed)
+            finally:
+                progress.close()
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     contexts_path.unlink(missing_ok=True)
     temp_path.replace(contexts_path)
+    _rewrite_summary_cache()
+    if failures:
+        with llm_failure_path.open("w", encoding="utf-8") as f:
+            for item in failures:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        raise RuntimeError(
+            f"LLM summary completed with {len(failures)} unresolved failures. "
+            f"See {llm_failure_path}"
+        )
+    llm_failure_path.unlink(missing_ok=True)
 
 
 def _reranker_score_cache_key(user_id: str, target_t: int, target_pid: str, hist_pid: str) -> str:
@@ -979,6 +1170,7 @@ def run_stage34(
     smoke: bool,
     text_embed_model: str = TEXT_EMBED_MODEL_NAME,
     text_embed_batch_size: int = TEXT_EMBED_BATCH_SIZE,
+    text_embed_max_length: int = TEXT_EMBED_MAX_LENGTH,
     text_rerank_model: str = TEXT_RERANK_MODEL_NAME,
     text_rerank_batch_size: int = TEXT_RERANK_BATCH_SIZE,
     use_qwen_reranker: bool = USE_QWEN_RERANKER,
@@ -991,6 +1183,8 @@ def run_stage34(
     llm_timeout_sec: int = 120,
     llm_max_tokens: int = 160,
     llm_temperature: float = 0.1,
+    llm_summary_workers: int = LLM_SUMMARY_WORKERS,
+    llm_summary_chunk_size: int = LLM_SUMMARY_CHUNK_SIZE,
     reuse_existing_contexts: bool = False,
     context_shard_index: int = 0,
     context_num_shards: int = 1,
@@ -1009,6 +1203,9 @@ def run_stage34(
         raise ValueError("--merge_context_shards requires context_num_shards > 1")
     if merge_context_shards and reuse_existing_contexts:
         raise ValueError("--merge_context_shards cannot be combined with --reuse_existing_contexts")
+    shard_mode = context_num_shards > 1 and not merge_context_shards
+    if shard_mode and enable_llm_summary:
+        raise ValueError("LLM summary must be run after shard merge; do not pass --enable_llm_summary in shard mode")
 
     problem_catalog_records: Dict[str, Dict[str, Any]] = {}
     with (priors_dir / "problem_catalog.jsonl").open("r", encoding="utf-8") as f:
@@ -1018,7 +1215,6 @@ def run_stage34(
             record = json.loads(line)
             problem_catalog_records[str(record["problem_id"])] = record
 
-    shard_mode = context_num_shards > 1 and not merge_context_shards
     shard_dir = ensure_dir(contexts_dir / "shards")
     report_shard_dir = ensure_dir(reports_dir / "shards")
     if shard_mode:
@@ -1073,6 +1269,8 @@ def run_stage34(
                 cache_dir=cache_dir,
                 problem_catalog_records=problem_catalog_records,
                 summarizer=summarizer,
+                llm_summary_workers=int(llm_summary_workers),
+                llm_summary_chunk_size=int(llm_summary_chunk_size),
             )
         embeddings_path: Optional[Path] = None
         if not dry_run:
@@ -1082,6 +1280,7 @@ def run_stage34(
                 device=device,
                 text_embed_model=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
                 text_embed_batch_size=int(text_embed_batch_size),
+                text_embed_max_length=int(text_embed_max_length),
             )
         result = Stage34Result(
             contexts_path=str(contexts_path),
@@ -1091,12 +1290,15 @@ def run_stage34(
             record_count=record_count,
             text_embed_model=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
             text_embed_batch_size=int(text_embed_batch_size),
+            text_embed_max_length=int(text_embed_max_length),
             text_rerank_model=str(text_rerank_model or TEXT_RERANK_MODEL_NAME),
             text_rerank_batch_size=int(text_rerank_batch_size),
             use_qwen_reranker=bool(use_qwen_reranker),
             rerank_topk=int(rerank_topk),
             rerank_weight=float(rerank_weight),
             reranker_cache_path=None,
+            llm_summary_workers=int(llm_summary_workers),
+            llm_summary_chunk_size=int(llm_summary_chunk_size),
             context_shard_index=context_shard_index,
             context_num_shards=context_num_shards,
             merge_context_shards=True,
@@ -1274,31 +1476,35 @@ def run_stage34(
 
         atomic_save_text("\n\n".join(preview_lines), preview_path)
 
-    if summarizer is not None:
+    if (not shard_mode) and summarizer is not None:
         _enrich_contexts_with_llm_summary(
             contexts_path=contexts_path,
             cache_dir=cache_dir,
             problem_catalog_records=problem_catalog_records,
             summarizer=summarizer,
+            llm_summary_workers=int(llm_summary_workers),
+            llm_summary_chunk_size=int(llm_summary_chunk_size),
         )
 
     embeddings_path: Optional[Path] = None
-    if not dry_run:
+    if (not shard_mode) and (not dry_run):
         embeddings_path = _build_context_embeddings(
             contexts_path=contexts_path,
             cache_dir=cache_dir,
             device=device,
             text_embed_model=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
             text_embed_batch_size=int(text_embed_batch_size),
+            text_embed_max_length=int(text_embed_max_length),
         )
 
-        result = Stage34Result(
+    result = Stage34Result(
         contexts_path=str(contexts_path),
         preview_path=str(preview_path),
         embeddings_path=str(embeddings_path) if embeddings_path is not None else None,
         manifest_path=str(manifest_path),
         record_count=record_count,
         text_embed_model=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
+        text_embed_max_length=int(text_embed_max_length),
         text_rerank_model=str(text_rerank_model or TEXT_RERANK_MODEL_NAME),
         use_qwen_reranker=bool(use_qwen_reranker),
         rerank_topk=int(rerank_topk),
@@ -1306,6 +1512,8 @@ def run_stage34(
         reranker_cache_path=str(reranker_cache_path.resolve()) if use_qwen_reranker else None,
         text_embed_batch_size=int(text_embed_batch_size),
         text_rerank_batch_size=int(text_rerank_batch_size),
+        llm_summary_workers=int(llm_summary_workers),
+        llm_summary_chunk_size=int(llm_summary_chunk_size),
         context_shard_index=context_shard_index,
         context_num_shards=context_num_shards,
         merge_context_shards=False,

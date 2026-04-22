@@ -21,6 +21,30 @@ from models.saint_context import SAINTContext
 from models.sakt_context import SAKTContext
 
 
+def unpack_context_batch(batch):
+    if len(batch) != 11:
+        raise ValueError(
+            "Unexpected batch size from collate_fn_with_context: "
+            f"expected 11 tensors (q, r, qshft, rshft, mask, eval_mask, ctx_main, ctx_tpl, ctx_llm, "
+            f"ctx_llm_struct, ctx_llm_struct_features), got {len(batch)}. "
+            "This usually means train_context.py and dataloader files are out of sync."
+        )
+    return batch
+
+
+def reset_context_fusion_stats(model) -> None:
+    fusion = getattr(model, "context_fusion", None)
+    if fusion is not None and hasattr(fusion, "reset_usage_stats"):
+        fusion.reset_usage_stats()
+
+
+def get_context_fusion_stats(model) -> Dict[str, float]:
+    fusion = getattr(model, "context_fusion", None)
+    if fusion is not None and hasattr(fusion, "get_usage_stats"):
+        return dict(fusion.get_usage_stats())
+    return {}
+
+
 def select_context(
     context_type: str,
     ctx_main: torch.Tensor | None,
@@ -128,14 +152,15 @@ def evaluate(model, loader, device: str, model_name: str, context_type: str) -> 
     preds = []
     targets = []
     losses = []
+    reset_context_fusion_stats(model)
     with torch.no_grad():
         for batch in tqdm(loader, desc="eval", leave=False):
-            q, r, qshft, rshft, mask, ctx_main, ctx_tpl, ctx_llm, ctx_llm_struct, ctx_llm_struct_features = batch
+            q, r, qshft, rshft, mask, eval_mask, ctx_main, ctx_tpl, ctx_llm, ctx_llm_struct, ctx_llm_struct_features = unpack_context_batch(batch)
             q = q.to(device)
             r = r.to(device)
             qshft = qshft.to(device)
             rshft = rshft.to(device)
-            mask = mask.to(device)
+            mask = mask.to(device) & eval_mask.to(device)
             ctx = select_context(context_type, ctx_main, ctx_tpl, ctx_llm, ctx_llm_struct, ctx_llm_struct_features)
             if ctx is not None:
                 ctx = ctx.to(device, non_blocking=True)
@@ -169,10 +194,11 @@ def evaluate(model, loader, device: str, model_name: str, context_type: str) -> 
     targets_np = torch.cat(targets).numpy()
     metrics_out = compute_eval_metrics(preds_np, targets_np)
     metrics_out["loss_mean"] = float(np.mean(losses)) if losses else 0.0
+    metrics_out["context_fusion"] = get_context_fusion_stats(model)
     return metrics_out
 
 
-def train(model, train_loader, test_loader, optimizer, num_epochs: int, device: str, model_name: str, context_type: str, ckpt_dir: Path):
+def train(model, train_loader, valid_loader, optimizer, num_epochs: int, device: str, model_name: str, context_type: str, ckpt_dir: Path):
     history = []
     best_auc = -1.0
     best_metrics: Dict[str, float] | None = None
@@ -182,14 +208,15 @@ def train(model, train_loader, test_loader, optimizer, num_epochs: int, device: 
     for epoch in range(1, num_epochs + 1):
         model.train()
         batch_losses = []
+        reset_context_fusion_stats(model)
         train_bar = tqdm(train_loader, desc=f"train epoch {epoch}", leave=False)
         for batch in train_bar:
-            q, r, qshft, rshft, mask, ctx_main, ctx_tpl, ctx_llm, ctx_llm_struct, ctx_llm_struct_features = batch
+            q, r, qshft, rshft, mask, eval_mask, ctx_main, ctx_tpl, ctx_llm, ctx_llm_struct, ctx_llm_struct_features = unpack_context_batch(batch)
             q = q.to(device)
             r = r.to(device)
             qshft = qshft.to(device)
             rshft = rshft.to(device)
-            mask = mask.to(device)
+            mask = mask.to(device) & eval_mask.to(device)
             ctx = select_context(context_type, ctx_main, ctx_tpl, ctx_llm, ctx_llm_struct, ctx_llm_struct_features)
             if ctx is not None:
                 ctx = ctx.to(device, non_blocking=True)
@@ -210,17 +237,44 @@ def train(model, train_loader, test_loader, optimizer, num_epochs: int, device: 
             train_bar.set_postfix(loss=f"{loss_value:.4f}")
 
         train_loss = float(np.mean(batch_losses)) if batch_losses else 0.0
-        eval_metrics = evaluate(model, test_loader, device, model_name, context_type)
+        train_context_fusion = get_context_fusion_stats(model)
+        eval_metrics = evaluate(model, valid_loader, device, model_name, context_type)
         history.append(
             {
                 "epoch": epoch,
                 "train_loss": train_loss,
+                "train_context_fusion": train_context_fusion,
                 "eval_metrics": eval_metrics,
             }
         )
+        train_gate_summary = ""
+        eval_gate_summary = ""
+        if context_type != "none":
+            if train_context_fusion.get("fusion_mode") == "gate" and int(train_context_fusion.get("usage_steps", 0)) > 0:
+                train_gate_summary = (
+                    ", Train Gate Mean: {gate_mean:.4f}, Train Ctx Weight: {ctx_weight_mean:.4f}, "
+                    "Train Gate<0.1: {gate_low:.4f}, Train Gate>0.9: {gate_high:.4f}"
+                ).format(
+                    gate_mean=float(train_context_fusion["gate_mean"]),
+                    ctx_weight_mean=float(train_context_fusion["ctx_weight_mean"]),
+                    gate_low=float(train_context_fusion["gate_lt_0_1_frac"]),
+                    gate_high=float(train_context_fusion["gate_gt_0_9_frac"]),
+                )
+            eval_context_fusion = eval_metrics.get("context_fusion") or {}
+            if eval_context_fusion.get("fusion_mode") == "gate" and int(eval_context_fusion.get("usage_steps", 0)) > 0:
+                eval_gate_summary = (
+                    ", Eval Gate Mean: {gate_mean:.4f}, Eval Ctx Weight: {ctx_weight_mean:.4f}, "
+                    "Eval Gate<0.1: {gate_low:.4f}, Eval Gate>0.9: {gate_high:.4f}"
+                ).format(
+                    gate_mean=float(eval_context_fusion["gate_mean"]),
+                    ctx_weight_mean=float(eval_context_fusion["ctx_weight_mean"]),
+                    gate_low=float(eval_context_fusion["gate_lt_0_1_frac"]),
+                    gate_high=float(eval_context_fusion["gate_gt_0_9_frac"]),
+                )
         print(
-            "Epoch: {epoch}, AUC: {auc:.6f}, ACC: {acc:.6f}, F1: {f1:.6f}, "
-            "BCE: {bce:.6f}, RMSE: {rmse:.6f}, Train Loss: {train_loss:.6f}, Eval Loss: {eval_loss:.6f}".format(
+            "Epoch: {epoch}, Valid AUC: {auc:.6f}, Valid ACC: {acc:.6f}, Valid F1: {f1:.6f}, "
+            "BCE: {bce:.6f}, RMSE: {rmse:.6f}, Train Loss: {train_loss:.6f}, Valid Loss: {eval_loss:.6f}"
+            "{train_gate_summary}{eval_gate_summary}".format(
                 epoch=epoch,
                 auc=float(eval_metrics["auc"]) if not math.isnan(float(eval_metrics["auc"])) else float("nan"),
                 acc=float(eval_metrics["acc"]),
@@ -229,6 +283,8 @@ def train(model, train_loader, test_loader, optimizer, num_epochs: int, device: 
                 rmse=float(eval_metrics["rmse"]),
                 train_loss=train_loss,
                 eval_loss=float(eval_metrics["loss_mean"]),
+                train_gate_summary=train_gate_summary,
+                eval_gate_summary=eval_gate_summary,
             )
         )
 
@@ -280,7 +336,13 @@ def main() -> None:
         default=str(workspace / "ckpts_context"),
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--split_mode", type=str, default="user", choices=["user", "new_concept"])
+    parser.add_argument("--test_concept_ratio", type=float, default=0.2)
+    parser.add_argument("--valid_ratio", type=float, default=0.1)
+    parser.add_argument("--cache_dataset", action="store_true")
+    parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--num_epochs", type=int, default=None)
     args = parser.parse_args()
 
     with (workspace / "models" / "config.json").open("r", encoding="utf-8") as f:
@@ -288,17 +350,32 @@ def main() -> None:
     train_config = dict(config["train_config"])
     model_config = dict(config[args.model_name])
 
+    if args.batch_size is not None:
+        train_config["batch_size"] = int(args.batch_size)
+    if args.num_epochs is not None:
+        train_config["num_epochs"] = int(args.num_epochs)
+
     seq_len = int(train_config["seq_len"])
-    dataset = MOOCRadarStrict(
-        seq_len=seq_len,
-        problem_json=args.problem_json,
-        student_json=args.student_json,
-        context_embeddings_path=args.context_embeddings_path,
-        dataset_dir=args.dataset_dir,
-        require_llm_context=(args.context_type == "llm"),
-        require_llm_struct_context=(args.context_type == "llm"),
-        require_llm_struct_feature_context=(args.context_type == "llm"),
-    )
+    dataset_kwargs = {
+        "seq_len": seq_len,
+        "problem_json": args.problem_json,
+        "student_json": args.student_json,
+        "context_embeddings_path": args.context_embeddings_path,
+        "dataset_dir": args.dataset_dir,
+        "require_llm_context": (args.context_type == "llm"),
+        "require_llm_struct_context": (args.context_type == "llm"),
+        "require_llm_struct_feature_context": (args.context_type == "llm"),
+        "split_mode": args.split_mode,
+        "seed": int(args.seed),
+        "test_concept_ratio": float(args.test_concept_ratio),
+        "cache_preprocessed": (args.split_mode == "user" or args.cache_dataset),
+    }
+    if args.split_mode == "new_concept":
+        dataset = MOOCRadarStrict(**dataset_kwargs, split_role="train_valid")
+        final_test_dataset = None
+    else:
+        dataset = MOOCRadarStrict(**dataset_kwargs, split_role="all")
+        final_test_dataset = None
     if args.context_type == "llm" and not dataset.has_llm_context:
         raise ValueError("Requested context_type=llm but context_embeddings.pkl does not contain llm_embeddings")
     if args.context_type == "llm" and not getattr(dataset, "has_llm_struct_context", False):
@@ -307,28 +384,49 @@ def main() -> None:
         raise ValueError("Requested context_type=llm but context_embeddings.pkl does not contain llm_struct_features")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    split_dir = Path(args.dataset_dir).resolve() / f"splits_seq{seq_len}_seed{int(args.seed)}"
-    train_dataset, test_dataset, split_stats = split_dataset(dataset, float(train_config["train_ratio"]), int(args.seed), split_dir)
+    effective_num_workers = int(args.num_workers) if args.num_workers is not None else (0 if args.context_type == "llm" else 4)
+    effective_batch_size = int(train_config["batch_size"])
+    print(
+        f"[train_context] model={args.model_name} context_type={args.context_type} "
+        f"split_mode={args.split_mode} "
+        f"batch_size={effective_batch_size} num_workers={effective_num_workers} "
+        f"context_dim={dataset.context_dim} llm_struct_dim={getattr(dataset, 'llm_struct_dim', 0)} "
+        f"llm_struct_feature_dim={getattr(dataset, 'llm_struct_feature_dim', 0)}",
+        flush=True,
+    )
+    valid_tag = str(float(args.valid_ratio)).replace(".", "p")
+    split_dir = Path(args.dataset_dir).resolve() / f"splits_{args.split_mode}_seq{seq_len}_seed{int(args.seed)}_valid{valid_tag}"
+    if args.split_mode == "new_concept":
+        train_ratio = 1.0 - float(args.valid_ratio)
+    else:
+        train_ratio = float(train_config["train_ratio"])
+    train_dataset, valid_dataset, split_stats = split_dataset(dataset, train_ratio, int(args.seed), split_dir)
+    split_stats.update(
+        {
+            "split_mode": args.split_mode,
+            "valid_ratio": float(args.valid_ratio),
+            "train_valid_dataset_stats": getattr(dataset, "split_stats", {}),
+        }
+    )
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=int(train_config["batch_size"]),
+        batch_size=effective_batch_size,
         shuffle=True,
         collate_fn=collate_fn_with_context,
-        num_workers=max(0, int(args.num_workers)),
+        num_workers=max(0, effective_num_workers),
         pin_memory=(device == "cuda"),
-        persistent_workers=(int(args.num_workers) > 0),
+        persistent_workers=(effective_num_workers > 0),
     )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=int(train_config["batch_size"]),
+    valid_loader = DataLoader(
+        valid_dataset,
+        batch_size=effective_batch_size,
         shuffle=False,
         collate_fn=collate_fn_with_context,
-        num_workers=max(0, int(args.num_workers)),
+        num_workers=max(0, effective_num_workers),
         pin_memory=(device == "cuda"),
-        persistent_workers=(int(args.num_workers) > 0),
+        persistent_workers=(effective_num_workers > 0),
     )
-
     if args.model_name in ("sakt", "saint"):
         model_config["n"] = seq_len
 
@@ -343,11 +441,11 @@ def main() -> None:
     else:
         raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
-    ckpt_dir = Path(args.ckpt_root).resolve() / args.model_name / args.context_type / args.fusion_type
+    ckpt_dir = Path(args.ckpt_root).resolve() / args.split_mode / args.model_name / args.context_type / args.fusion_type
     history, best_auc, best_path, best_metrics = train(
         model,
         train_loader,
-        test_loader,
+        valid_loader,
         optimizer,
         int(train_config["num_epochs"]),
         device,
@@ -355,6 +453,23 @@ def main() -> None:
         args.context_type,
         ckpt_dir,
     )
+    if best_path.exists():
+        model.load_state_dict(torch.load(best_path, map_location=device))
+    if args.split_mode == "new_concept":
+        final_test_dataset = MOOCRadarStrict(**dataset_kwargs, split_role="test")
+    else:
+        final_test_dataset = valid_dataset
+    split_stats["test_dataset_stats"] = getattr(final_test_dataset, "split_stats", {})
+    test_loader = DataLoader(
+        final_test_dataset,
+        batch_size=effective_batch_size,
+        shuffle=False,
+        collate_fn=collate_fn_with_context,
+        num_workers=max(0, effective_num_workers),
+        pin_memory=(device == "cuda"),
+        persistent_workers=(effective_num_workers > 0),
+    )
+    test_metrics = evaluate(model, test_loader, device, args.model_name, args.context_type)
 
     metrics_path = ckpt_dir / "metrics.json"
     with metrics_path.open("w", encoding="utf-8") as f:
@@ -362,10 +477,12 @@ def main() -> None:
             {
                 "model_name": args.model_name,
                 "context_type": args.context_type,
+                "split_mode": args.split_mode,
                 "device": device,
-                "dataset_len": len(dataset),
+                "train_valid_dataset_len": len(dataset),
                 "train_len": len(train_dataset),
-                "test_len": len(test_dataset),
+                "valid_len": len(valid_dataset),
+                "test_len": len(final_test_dataset),
                 "split_stats": split_stats,
                 "context_dim": dataset.context_dim,
                 "has_llm_context": dataset.has_llm_context,
@@ -374,8 +491,9 @@ def main() -> None:
                 "has_llm_struct_feature_context": getattr(dataset, "has_llm_struct_feature_context", False),
                 "llm_struct_feature_dim": getattr(dataset, "llm_struct_feature_dim", 0),
                 "fusion_type": args.fusion_type,
-                "best_auc": best_auc,
-                "best_metrics": best_metrics,
+                "best_valid_auc": best_auc,
+                "best_valid_metrics": best_metrics,
+                "test_metrics": test_metrics,
                 "best_ckpt": str(best_path),
                 "history": history,
             },
@@ -388,7 +506,10 @@ def main() -> None:
     print("[MODEL]", args.model_name)
     print("[CONTEXT]", args.context_type)
     print("[FUSION]", args.fusion_type)
-    print("[BEST_AUC]", best_auc)
+    print("[SPLIT_MODE]", args.split_mode)
+    print("[BEST_VALID_AUC]", best_auc)
+    print("[TEST_AUC]", test_metrics.get("auc"))
+    print("[TEST_ACC]", test_metrics.get("acc"))
     print("[METRICS]", metrics_path)
 
 

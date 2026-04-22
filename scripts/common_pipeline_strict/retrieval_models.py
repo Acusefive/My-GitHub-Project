@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
 import numpy as np
 import torch
+from tqdm import tqdm
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 
@@ -55,12 +57,23 @@ class QwenEmbeddingEncoder:
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
         ).to(device).eval()
+        self.embedding_dim = int(getattr(self.model.config, "hidden_size"))
 
-    def encode_texts(self, texts: Sequence[str], *, instruction: Optional[str] = None) -> np.ndarray:
+    def encode_texts(
+        self,
+        texts: Sequence[str],
+        *,
+        instruction: Optional[str] = None,
+        desc: Optional[str] = None,
+    ) -> np.ndarray:
         all_vectors: List[np.ndarray] = []
         normalized_instruction = str(instruction or "").strip()
+        total_batches = (len(texts) + self.batch_size - 1) // self.batch_size if self.batch_size > 0 else 0
         with torch.inference_mode():
-            for start in range(0, len(texts), self.batch_size):
+            batch_iter = range(0, len(texts), self.batch_size)
+            if desc:
+                batch_iter = tqdm(batch_iter, total=total_batches, desc=desc)
+            for start in batch_iter:
                 batch = [str(text or "").strip() for text in texts[start : start + self.batch_size]]
                 if normalized_instruction:
                     batch = [f"Instruct: {normalized_instruction}\nQuery: {text}" for text in batch]
@@ -75,8 +88,92 @@ class QwenEmbeddingEncoder:
                 outputs = self.model(**tokens)
                 pooled = _last_token_pool(outputs.last_hidden_state, tokens["attention_mask"])
                 pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
-                all_vectors.append(pooled.detach().cpu().numpy().astype(np.float32))
+                all_vectors.append(pooled.detach().float().cpu().numpy().astype(np.float32))
         return np.concatenate(all_vectors, axis=0) if all_vectors else np.zeros((0, 0), dtype=np.float32)
+
+    def encode_texts_resumable(
+        self,
+        texts: Sequence[str],
+        *,
+        instruction: Optional[str] = None,
+        desc: Optional[str] = None,
+        cache_prefix: Path,
+    ) -> np.ndarray:
+        normalized_instruction = str(instruction or "").strip()
+        cache_prefix = Path(cache_prefix)
+        cache_prefix.parent.mkdir(parents=True, exist_ok=True)
+        array_path = cache_prefix.with_suffix(".npy")
+        meta_path = cache_prefix.with_suffix(".meta.json")
+        total = len(texts)
+        expected_meta = {
+            "count": int(total),
+            "dim": int(self.embedding_dim),
+            "instruction": normalized_instruction,
+            "model_name_or_path": self.model_name_or_path,
+            "max_length": int(self.max_length),
+        }
+
+        completed = 0
+        recreate = True
+        if array_path.exists() and meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if all(meta.get(k) == v for k, v in expected_meta.items()):
+                    completed = int(meta.get("completed", 0))
+                    completed = max(0, min(completed, total))
+                    recreate = False
+            except Exception:
+                recreate = True
+
+        mode = "w+" if recreate else "r+"
+        mmap = np.lib.format.open_memmap(
+            array_path,
+            mode=mode,
+            dtype=np.float32,
+            shape=(total, self.embedding_dim),
+        )
+        if recreate:
+            completed = 0
+            meta = dict(expected_meta)
+            meta["completed"] = 0
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        if completed >= total:
+            if desc:
+                print(f"[embed-cache] reuse completed {desc}: {array_path}", flush=True)
+            return np.load(array_path, mmap_mode="r")
+
+        total_batches = (total + self.batch_size - 1) // self.batch_size if self.batch_size > 0 else 0
+        start_batch = completed // self.batch_size
+        batch_iter = range(completed, total, self.batch_size)
+        if desc:
+            batch_iter = tqdm(batch_iter, total=total_batches, initial=start_batch, desc=desc)
+
+        with torch.inference_mode():
+            for start in batch_iter:
+                end = min(start + self.batch_size, total)
+                batch = [str(text or "").strip() for text in texts[start:end]]
+                if normalized_instruction:
+                    batch = [f"Instruct: {normalized_instruction}\nQuery: {text}" for text in batch]
+                tokens = self.tokenizer(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length,
+                    return_tensors="pt",
+                )
+                tokens = {key: value.to(self.device) for key, value in tokens.items()}
+                outputs = self.model(**tokens)
+                pooled = _last_token_pool(outputs.last_hidden_state, tokens["attention_mask"])
+                pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
+                vectors = pooled.detach().float().cpu().numpy().astype(np.float32)
+                mmap[start:end] = vectors
+                mmap.flush()
+                meta = dict(expected_meta)
+                meta["completed"] = int(end)
+                meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        return np.load(array_path, mmap_mode="r")
 
 
 class QwenReranker:

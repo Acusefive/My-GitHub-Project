@@ -833,6 +833,7 @@ def run_stage32(
     smoke: bool = False,
     text_embed_model: str = TEXT_EMBED_MODEL_NAME,
     text_embed_batch_size: int = TEXT_EMBED_BATCH_SIZE,
+    text_embed_max_length: int = TEXT_EMBED_MAX_LENGTH,
     enable_llm_graph_completion: bool = False,
     llm_base_url: str = "",
     llm_model: str = "",
@@ -859,7 +860,7 @@ def run_stage32(
     encoder = QwenEmbeddingEncoder(
         model_name_or_path=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
         device=pick_device(),
-        max_length=TEXT_EMBED_MAX_LENGTH,
+        max_length=int(text_embed_max_length),
         batch_size=int(text_embed_batch_size),
     )
     raw_texts = [problem.text or problem.title or problem.problem_id for problem in problem_records]
@@ -962,6 +963,7 @@ def run_stage32(
     implementation_defaults = {
         "text_embed_model_name": str(text_embed_model or TEXT_EMBED_MODEL_NAME),
         "text_embed_batch_size": int(text_embed_batch_size),
+        "text_embed_max_length": int(text_embed_max_length),
         "kglobal": KGLOBAL,
         "klocal": KLOCAL,
         "random_state": KMEANS_RANDOM_STATE,

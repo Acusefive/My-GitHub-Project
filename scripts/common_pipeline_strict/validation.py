@@ -18,6 +18,7 @@ from .stage32 import build_semantic_ids
 class ValidationResult:
     report_path: str
     semantic_ids_stable: bool
+    semantic_id_quality_ok: bool
     context_records_checked: int
     failures: List[str]
 
@@ -40,6 +41,8 @@ def run_validation(
     problem_json: Path,
     smoke: bool,
 ) -> ValidationResult:
+    semantic_flagged_ratio_threshold = 0.20
+    semantic_fallback_ratio_threshold = 0.35
     priors_dir = out_root / "priors"
     contexts_dir = out_root / "contexts"
     reports_dir = out_root / "reports"
@@ -75,7 +78,7 @@ def run_validation(
     ]
     ordered_hqtext = [hqtext_map[problem.problem_id] for problem in recompute_problems]
     recomputed_path = reports_dir / "semantic_ids_recomputed.json"
-    recomputed_ids, _semantic_texts = build_semantic_ids(
+    recomputed_ids, _semantic_texts, recomputed_semantic_audit = build_semantic_ids(
         recompute_problems,
         text_vectors=np.stack(ordered_hqtext, axis=0),
         semantic_ids_path=recomputed_path,
@@ -84,6 +87,38 @@ def run_validation(
     if not semantic_ids_stable:
         failures.append("semantic_ids_not_stable")
 
+    semantic_audit_path = Path(str(stage32_manifest.get("semantic_id_audit_path") or priors_dir / "semantic_id_audit.json"))
+    if semantic_audit_path.exists():
+        semantic_id_audit = json.loads(semantic_audit_path.read_text(encoding="utf-8"))
+    else:
+        semantic_id_audit = recomputed_semantic_audit
+        semantic_audit_path = reports_dir / "semantic_id_audit_recomputed.json"
+        write_json(semantic_id_audit, semantic_audit_path)
+
+    semantic_category_counts = semantic_id_audit.get("category_counts") or {}
+    semantic_generation_stats = semantic_id_audit.get("generation_stats") or {}
+    semantic_flagged_ratio = float(semantic_id_audit.get("flagged_ratio") or 0.0)
+    semantic_contains_noise = int(semantic_category_counts.get("contains_noise") or 0)
+    semantic_duplicate_count = int(semantic_category_counts.get("duplicate_tokens") or 0)
+    semantic_empty_count = int(semantic_category_counts.get("empty") or 0)
+    macro_fallback_count = int(semantic_generation_stats.get("macro_fallback_count") or 0)
+    micro_fallback_count = int(semantic_generation_stats.get("micro_fallback_count") or 0)
+    semantic_problem_count = int(semantic_id_audit.get("total_ids") or len(problem_catalog) or 1)
+    macro_fallback_ratio = float(macro_fallback_count) / float(max(semantic_problem_count, 1))
+    micro_fallback_ratio = float(micro_fallback_count) / float(max(semantic_problem_count, 1))
+
+    if semantic_contains_noise > 0:
+        failures.append("semantic_id_contains_noise_tokens")
+    if semantic_duplicate_count > 0:
+        failures.append("semantic_id_duplicate_tokens_present")
+    if semantic_empty_count > 0:
+        failures.append("semantic_id_empty_present")
+    if semantic_flagged_ratio > semantic_flagged_ratio_threshold:
+        failures.append("semantic_id_flagged_ratio_too_high")
+    if macro_fallback_ratio > semantic_fallback_ratio_threshold:
+        failures.append("semantic_id_macro_fallback_ratio_too_high")
+    if micro_fallback_ratio > semantic_fallback_ratio_threshold:
+        failures.append("semantic_id_micro_fallback_ratio_too_high")
     if len(semantic_ids) != len(problem_catalog):
         failures.append("semantic_id_coverage_mismatch")
     if len(problem_mu_q) != len(problem_catalog):
@@ -300,12 +335,29 @@ def run_validation(
         if not llm_embedding_checks.get("has_llm_struct_features"):
             failures.append("llm_struct_features_missing")
 
+    semantic_id_quality_ok = not any(
+        failure.startswith("semantic_id_")
+        for failure in failures
+    )
+
     report = {
         "stage32_manifest": stage32_manifest,
         "stage34_manifest": stage34_manifest,
         "semantic_ids_stable": semantic_ids_stable,
+        "semantic_id_quality_ok": semantic_id_quality_ok,
         "problem_count": len(problem_catalog),
         "context_records_checked": len(contexts),
+        "semantic_id_checks": {
+            "audit_path": str(semantic_audit_path),
+            "flagged_ratio": semantic_flagged_ratio,
+            "flagged_ratio_threshold": semantic_flagged_ratio_threshold,
+            "macro_fallback_ratio": macro_fallback_ratio,
+            "micro_fallback_ratio": micro_fallback_ratio,
+            "fallback_ratio_threshold": semantic_fallback_ratio_threshold,
+            "category_counts": semantic_category_counts,
+            "generation_stats": semantic_generation_stats,
+            "top_suspicious_tokens": semantic_id_audit.get("top_suspicious_tokens") or [],
+        },
         "graph_constraints": {
             "has_explicit_prerequisite": graph_bundle.get("has_explicit_prerequisite"),
             "e_pre_size": len(graph_bundle.get("e_pre") or []),
@@ -350,6 +402,7 @@ def run_validation(
     return ValidationResult(
         report_path=str(report_path),
         semantic_ids_stable=semantic_ids_stable,
+        semantic_id_quality_ok=semantic_id_quality_ok,
         context_records_checked=len(contexts),
         failures=failures,
     )

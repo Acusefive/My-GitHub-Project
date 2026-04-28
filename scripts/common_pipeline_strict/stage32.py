@@ -5,10 +5,12 @@ import json
 import math
 import pickle
 import random
+import re
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import (Any, Dict, Iterable, Iterator, List, Optional, Sequence,
+                    Tuple)
 
 import jieba
 import numpy as np
@@ -19,61 +21,25 @@ from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import CountVectorizer
 from tqdm import tqdm
 
-from .constants import (
-    A_SCALE,
-    COLLAB_WINDOW,
-    CTFIDF_MAX_FEATURES,
-    DS,
-    EPS,
-    GRAPH_LLM_CANDIDATE_LIMIT,
-    GRAPH_LLM_MAX_PREREQ,
-    GRAPH_LLM_MAX_RELATED,
-    HISTORY_WINDOW,
-    KGLOBAL,
-    KLOCAL,
-    KMEANS_N_INIT,
-    KMEANS_RANDOM_STATE,
-    LAMBDA_L,
-    LAMBDA_T,
-    LOCAL_COOCCUR_THRESHOLD,
-    NEGATIVE_SAMPLES,
-    RASCH_A,
-    RASCH_EPOCHS,
-    RASCH_LAMBDA_MU,
-    RASCH_LAMBDA_THETA,
-    RASCH_LR,
-    SMOKE_MAX_PROBLEMS,
-    SMOKE_MAX_STUDENTS,
-    SMOKE_MAX_TARGETS_PER_STUDENT,
-    SMOKE_TRAIN_MAX_SAMPLES,
-    STOP_WORDS,
-    TAU,
-    TEXT_EMBED_BATCH_SIZE,
-    TEXT_EMBED_MAX_LENGTH,
-    TEXT_EMBED_MODEL_NAME,
-    TRAIN_BATCH_SIZE,
-    TRAIN_EARLY_STOP_PATIENCE,
-    TRAIN_GRAD_CLIP,
-    TRAIN_LR,
-    TRAIN_MAX_EPOCHS,
-    TRAIN_SEED,
-    TRAIN_VAL_MOD,
-    USE_RASCH_ENHANCEMENT,
-)
-from .io_utils import (
-    ProblemRecord,
-    StudentSequence,
-    atomic_save_text,
-    dataclass_list_to_jsonl,
-    ensure_dir,
-    load_problem_records,
-    load_student_sequences,
-    pick_device,
-    user_hash_bucket,
-    write_json,
-    write_jsonl,
-)
-from .llm_utils import OpenAICompatibleGraphCompleter, append_json_cache, load_json_cache
+from .constants import (A_SCALE, COLLAB_WINDOW, CTFIDF_MAX_FEATURES, DS, EPS,
+                        GRAPH_LLM_CANDIDATE_LIMIT, GRAPH_LLM_MAX_PREREQ,
+                        GRAPH_LLM_MAX_RELATED, HISTORY_WINDOW, KGLOBAL, KLOCAL,
+                        KMEANS_N_INIT, KMEANS_RANDOM_STATE, LAMBDA_L, LAMBDA_T,
+                        LOCAL_COOCCUR_THRESHOLD, NEGATIVE_SAMPLES, RASCH_A,
+                        RASCH_EPOCHS, RASCH_LAMBDA_MU, RASCH_LAMBDA_THETA,
+                        RASCH_LR, SMOKE_MAX_PROBLEMS, SMOKE_MAX_STUDENTS,
+                        SMOKE_MAX_TARGETS_PER_STUDENT, SMOKE_TRAIN_MAX_SAMPLES,
+                        STOP_WORDS, TAU, TEXT_EMBED_BATCH_SIZE,
+                        TEXT_EMBED_MAX_LENGTH, TEXT_EMBED_MODEL_NAME,
+                        TRAIN_BATCH_SIZE, TRAIN_EARLY_STOP_PATIENCE,
+                        TRAIN_GRAD_CLIP, TRAIN_LR, TRAIN_MAX_EPOCHS,
+                        TRAIN_SEED, TRAIN_VAL_MOD, USE_RASCH_ENHANCEMENT)
+from .io_utils import (ProblemRecord, StudentSequence, atomic_save_text,
+                       dataclass_list_to_jsonl, ensure_dir,
+                       load_problem_records, load_student_sequences,
+                       pick_device, user_hash_bucket, write_json, write_jsonl)
+from .llm_utils import (OpenAICompatibleGraphCompleter, append_json_cache,
+                        load_json_cache)
 from .models import StrictPriorModel
 from .retrieval_models import QwenEmbeddingEncoder
 
@@ -82,6 +48,7 @@ from .retrieval_models import QwenEmbeddingEncoder
 class Stage32Result:
     priors_dir: str
     semantic_ids_path: str
+    semantic_id_audit_path: str
     semantic_vectors_path: str
     hqtext_vectors_path: str
     hqid_vectors_path: str
@@ -101,6 +68,18 @@ class Stage32Result:
 
 
 @dataclass
+class Stage32CoreArtifactsResult:
+    priors_dir: str
+    semantic_ids_path: str
+    semantic_id_audit_path: str
+    problem_catalog_path: str
+    item_collaborative_path: str
+    manifest_path: str
+    problem_count: int
+    student_count: int
+
+
+@dataclass
 class ProblemCatalogRecord:
     problem_id: str
     semantic_id: str
@@ -112,8 +91,197 @@ class ProblemCatalogRecord:
     concepts: List[str]
 
 
+SEMANTIC_EXTRA_STOP_WORDS = {
+    "the",
+    "of",
+    "to",
+    "in",
+    "for",
+    "with",
+    "on",
+    "at",
+    "by",
+    "from",
+    "is",
+    "nbsp",
+    "amp",
+    "lt",
+    "gt",
+    "div",
+    "span",
+    "class",
+    "style",
+    "width",
+    "height",
+    "mathjaxinline",
+    "mathjaxdisplay",
+    "pmatrix",
+    "bmatrix",
+    "vmatrix",
+    "matrix",
+    "begin",
+    "end",
+    "left",
+    "right",
+    "frac",
+    "sqrt",
+    "overline",
+    "underline",
+    "mathbf",
+    "mathrm",
+    "sumlimits",
+    "myclass",
+    "cookie",
+    "blank",
+    "填空",    "填空", "选择", "下列", "属于", "关于", "正确", "错误", "选项", "描述", "答案",
+    "一个", "什么", "可以", "的是", "以及", "因为", "所以", "如图", "所示", "包括",
+    "内容", "题目", "问题", "我们", "你们", "它们", "这个", "那个", "部分",
+    "与其", "不如", "虽然", "但是", "不仅", "而且", "其中", "或者", "如果",
+    "ABCD", "A.", "B.", "C.", "D.", "1.", "2.", "3.", "4.", "000","100",
+    "主要", "根据", "特征", "具有", "一种", "一般", "通常", "使用", "利用"," ", "\n", "\t", "br", "&nbsp;",
+    "的", "了", "和", "是", "在", "与", "及", "或", 'nbsp','the','以下','说法','下面','进行',"单选",
+    "分析", "解答", "解析", "答案", "详解", "过程", "步骤", "结论",  # 题目结构词
+    "如图", "所示", "下列", "选项", "已知", "求证", "计算", "求解", "关于", # 题目引导词
+    "正确", "错误", "属于", "可以", "怎么", "什么", "为什么", "结构", "特征", "性质","一项","两项","三项","四项","____","_____", # 泛泛的名词
+    "系统", "理论", "曲线", "模型", "定义", "原理", "方法", "基础", "基本",
+    "概念", "应用", "技术", "作业", "习题", "第一章", "第二章", "第三章",
+    "第四章", "第五章", "第六章", "第七章", "第八章", "测试", "练习题",
+    "企业", "公司", "质量", "方式", "研究", "设计", "应用", "管理",
+    "不同", "影响", "作用", "相关", "主要", "手段", "目的", "特点",
+    "frac", "amp", "div", "span", "class", "style", "width", "height","ldquo","rdquo","sumlimits","&#","pmatrix","begin","end","matrix","left","right","left[","right]","rm","mu","theta", # HTML/LaTeX 垃圾
+    "of", "to", "in", "for", "with", "on", "at", "by", "from","is","mathjaxinline","mathbf","red","black","blue","green","yellow","purple","orange","brown","gray","pink","lime","teal","indigo","violet","maroon","navy","olive","crimson","azure","fuchsia","chartreuse","coral","cyan","gold","silver","plum","salmon","tan","turquoise","wheat","ivory","khaki","lavender","magenta","mistyrose","navajowhite","oldlace","papayawhip","peachpuff","peru","pink","plum","powderblue","rosybrown","royalblue","sienna","skyblue","slateblue","slategray","snow","springgreen","steelblue","tan","thistle","tomato","turquoise","violet","wheat","whitesmoke","yellowgreen","black","blue","green","red","yellow","purple","orange","brown","gray","pink","lime","teal","indigo","violet","maroon","navy","olive","crimson","azure","fuchsia","chartreuse","coral","cyan","gold","silver","plum","salmon","tan","turquoise","wheat","ivory","khaki","lavender","magenta","mistyrose","navajowhite","oldlace","papayawhip","peachpuff","peru","pink","plum","powderblue","rosybrown","royalblue","sienna","skyblue","slateblue","slategray","snow","springgreen","steelblue","tan","thistle","tomato","turquoise","violet","wheat","whitesmoke","yellowgreen", # 常见英文停用词
+    "哪些", "哪个", "什么", "怎样", "如何","哪项", # 疑问词
+    "关系", "区别", "联系", "比较", "自己" , "吴起", "沈博阳", "地区", "恐龙", "next", "php", "完全", "第三", "万元", "eps", "noteexpress","ag","对否","结果","tree","quot","00","lambda","and","circuit","multiple","port","figure","dx","int","lim","infty",""# 逻辑连接词（非实体）
+}
+
+SEMANTIC_PLACEHOLDER_RE = re.compile(r"^_+$")
+SEMANTIC_ALNUM_TAG_RE = re.compile(r"^[a-z]{1,3}\d{1,4}$", re.IGNORECASE)
+SEMANTIC_STRIP_RE = re.compile(r"^[\s\-_`~!@#$%^&*+=|\\/:;\"'<>,.?()\[\]{}]+|[\s\-_`~!@#$%^&*+=|\\/:;\"'<>,.?()\[\]{}]+$")
+
+
+def _normalize_semantic_token(token: str) -> str:
+    token = str(token or "").strip()
+    if not token:
+        return ""
+    token = token.replace("&nbsp;", "nbsp").replace("&#", "").strip()
+    token = SEMANTIC_STRIP_RE.sub("", token)
+    return token.strip()
+
+
+def _has_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def _is_semantic_noise(token: str) -> bool:
+    normalized = _normalize_semantic_token(token)
+    if not normalized:
+        return True
+    lowered = normalized.lower()
+    if lowered == "misc":
+        return True
+    if normalized in STOP_WORDS or lowered in STOP_WORDS:
+        return True
+    if lowered in SEMANTIC_EXTRA_STOP_WORDS:
+        return True
+    if "____" in normalized or SEMANTIC_PLACEHOLDER_RE.fullmatch(normalized):
+        return True
+    if lowered.startswith("mathjax"):
+        return True
+    if lowered.endswith("inline") and lowered.startswith("math"):
+        return True
+    if SEMANTIC_ALNUM_TAG_RE.fullmatch(normalized) and not _has_cjk(normalized):
+        return True
+    return False
+
+
+def _sanitize_semantic_token(token: str) -> str:
+    normalized = _normalize_semantic_token(token)
+    if _is_semantic_noise(normalized):
+        return ""
+    return normalized
+
+
+def _extract_fallback_token(text: str) -> str:
+    if not text:
+        return ""
+    for token in jieba.lcut(str(text)):
+        cleaned = _sanitize_semantic_token(token)
+        if cleaned:
+            return cleaned
+    cleaned = _sanitize_semantic_token(text)
+    if cleaned:
+        return cleaned
+    return ""
+
+
+def _semantic_fallback_token(problem: ProblemRecord, *, prefer_chapter: bool) -> str:
+    candidates: List[str] = []
+    if prefer_chapter:
+        candidates.extend([problem.chapter, *problem.concepts, problem.title, problem.text])
+    else:
+        candidates.extend([*problem.concepts, problem.title, problem.text, problem.chapter])
+    for candidate in candidates:
+        fallback = _extract_fallback_token(candidate)
+        if fallback:
+            return fallback
+    return "misc"
+
+
+def _join_semantic_id_parts(macro: str, micro: str) -> str:
+    parts: List[str] = []
+    for token in [*str(macro).split("-"), *str(micro).split("-")]:
+        cleaned = _sanitize_semantic_token(token)
+        if not cleaned:
+            continue
+        if cleaned in parts:
+            continue
+        parts.append(cleaned)
+    return "-".join(parts) if parts else "misc"
+
+
+def _compose_semantic_id(problem: ProblemRecord, macro_label: str, micro_label: str) -> str:
+    macro = _sanitize_semantic_token(macro_label) or _semantic_fallback_token(problem, prefer_chapter=True)
+    micro = _sanitize_semantic_token(micro_label) or _semantic_fallback_token(problem, prefer_chapter=False)
+    return _join_semantic_id_parts(macro, micro)
+
+
+def _compose_semantic_id_with_stats(
+    problem: ProblemRecord,
+    macro_label: str,
+    micro_label: str,
+    stats: Counter,
+) -> str:
+    macro = _sanitize_semantic_token(macro_label)
+    if not macro:
+        stats["macro_fallback_count"] += 1
+        macro = _semantic_fallback_token(problem, prefer_chapter=True)
+
+    micro = _sanitize_semantic_token(micro_label)
+    if not micro:
+        stats["micro_fallback_count"] += 1
+        micro = _semantic_fallback_token(problem, prefer_chapter=False)
+
+    semantic_id = _join_semantic_id_parts(macro, micro)
+    if semantic_id == macro:
+        stats["duplicate_collapsed_count"] += 1
+    return semantic_id
+
+
 def _jieba_tokenizer(text: str) -> List[str]:
-    return [token for token in jieba.lcut(text) if len(token) > 1 and token not in STOP_WORDS]
+    tokens: List[str] = []
+    for token in jieba.lcut(text):
+        cleaned = _sanitize_semantic_token(token)
+        if len(cleaned) > 1:
+            tokens.append(cleaned)
+    return tokens
+
+
+def _semantic_cluster_text(problem: ProblemRecord) -> str:
+    parts = [problem.text or problem.title or problem.problem_id]
+    clean_concepts = [concept for concept in problem.concepts if _sanitize_semantic_token(concept)]
+    if clean_concepts:
+        parts.append(" ".join(clean_concepts))
+    return " ".join(part for part in parts if part).strip()
 
 
 def canonicalize_cluster_labels(labels: np.ndarray) -> np.ndarray:
@@ -139,17 +307,20 @@ def compute_ctfidf_labels(
     *,
     max_features: int,
 ) -> Dict[int, str]:
+    k = int(labels.max()) + 1 if labels.size else 0
+    label_names: Dict[int, str] = {cid: "misc" for cid in range(k)}
+    if k <= 0:
+        return label_names
     vectorizer = CountVectorizer(
         tokenizer=_jieba_tokenizer,
         max_features=max_features,
         token_pattern=None,
     )
-    dtm_all = vectorizer.fit_transform(texts)
-    vocab = vectorizer.get_feature_names_out()
-    k = int(labels.max()) + 1 if labels.size else 0
-    label_names: Dict[int, str] = {}
-    if k <= 0:
+    try:
+        dtm_all = vectorizer.fit_transform(texts)
+    except ValueError:
         return label_names
+    vocab = vectorizer.get_feature_names_out()
 
     token_sums = np.zeros((k, len(vocab)), dtype=np.float64)
     doc_counts = np.zeros((k,), dtype=np.float64)
@@ -177,7 +348,8 @@ def pick_top_token_from_ctfidf(ctfidf: np.ndarray, vocab: np.ndarray) -> str:
     candidates: List[Tuple[float, str]] = []
     for idx, score in enumerate(ctfidf.tolist()):
         token = str(vocab[int(idx)])
-        if not token or token in STOP_WORDS:
+        token = _sanitize_semantic_token(token)
+        if not token:
             continue
         candidates.append((float(score), token))
     if candidates:
@@ -186,26 +358,130 @@ def pick_top_token_from_ctfidf(ctfidf: np.ndarray, vocab: np.ndarray) -> str:
     return "misc"
 
 
+def extract_cluster_keywords(texts: Sequence[str], *, top_n: int = 2, max_features: int = 50) -> str:
+    if not texts:
+        return "misc"
+    vectorizer = CountVectorizer(
+        tokenizer=_jieba_tokenizer,
+        max_features=max_features,
+        token_pattern=None,
+    )
+    try:
+        dtm = vectorizer.fit_transform(texts)
+    except ValueError:
+        return "misc"
+    vocab = vectorizer.get_feature_names_out()
+    freqs = np.asarray(dtm.sum(axis=0)).ravel()
+    keywords: List[str] = []
+    for idx in freqs.argsort()[::-1]:
+        token = _sanitize_semantic_token(str(vocab[int(idx)]))
+        if token and token not in keywords:
+            keywords.append(token)
+        if len(keywords) >= top_n:
+            break
+    return "-".join(keywords) if keywords else "misc"
+
+
+def compute_cluster_frequency_labels(
+    texts: Sequence[str],
+    labels: np.ndarray,
+    *,
+    top_n: int,
+) -> Dict[int, str]:
+    k = int(labels.max()) + 1 if labels.size else 0
+    label_names: Dict[int, str] = {cid: "misc" for cid in range(k)}
+    for cid in range(k):
+        idxs = np.where(labels == cid)[0]
+        if len(idxs) == 0:
+            continue
+        label_names[cid] = extract_cluster_keywords(
+            [texts[int(idx)] for idx in idxs],
+            top_n=top_n,
+        )
+    return label_names
+
+
+def build_semantic_id_audit_report(
+    problem_records: Sequence[ProblemRecord],
+    semantic_ids: Dict[str, str],
+    generation_stats: Counter,
+) -> Dict[str, Any]:
+    problem_map = {problem.problem_id: problem for problem in problem_records}
+    category_counts: Counter = Counter()
+    suspicious_tokens: Counter = Counter()
+    flagged_samples: List[Dict[str, Any]] = []
+    flagged_problem_count = 0
+
+    for pid, semantic_id in semantic_ids.items():
+        token_parts = [part.strip() for part in str(semantic_id).split("-") if part.strip()]
+        flags: List[str] = []
+        if not token_parts:
+            flags.append("empty")
+        if len(token_parts) == 1:
+            category_counts["single_token_ids"] += 1
+        else:
+            category_counts["pair_ids"] += 1
+
+        if len(token_parts) >= 2 and len({part.lower() for part in token_parts}) == 1:
+            flags.append("duplicate_tokens")
+
+        for token in token_parts:
+            if _is_semantic_noise(token):
+                flags.append("contains_noise")
+                suspicious_tokens[token] += 1
+
+        if flags:
+            flagged_problem_count += 1
+            unique_flags = sorted(set(flags))
+            category_counts.update(unique_flags)
+            if len(flagged_samples) < 50:
+                problem = problem_map.get(pid)
+                flagged_samples.append(
+                    {
+                        "problem_id": pid,
+                        "semantic_id": semantic_id,
+                        "flags": unique_flags,
+                        "chapter": problem.chapter if problem else "",
+                        "concepts": problem.concepts if problem else [],
+                    }
+                )
+
+    total_ids = len(semantic_ids)
+    return {
+        "total_ids": total_ids,
+        "flagged_ids": int(flagged_problem_count),
+        "flagged_ratio": round(float(flagged_problem_count) / float(max(total_ids, 1)), 4),
+        "category_counts": dict(category_counts),
+        "generation_stats": dict(generation_stats),
+        "top_suspicious_tokens": suspicious_tokens.most_common(50),
+        "sample_flagged": flagged_samples,
+    }
+
+
 def build_semantic_ids(
     problem_records: Sequence[ProblemRecord],
     text_vectors: np.ndarray,
     *,
     semantic_ids_path: Path,
-) -> Tuple[Dict[str, str], List[str]]:
+) -> Tuple[Dict[str, str], List[str], Dict[str, Any]]:
     problem_ids = [problem.problem_id for problem in problem_records]
-    texts = [problem.text or problem.title or problem.problem_id for problem in problem_records]
+    texts = [_semantic_cluster_text(problem) for problem in problem_records]
     k1 = min(KGLOBAL, len(problem_ids))
     km1 = KMeans(n_clusters=k1, random_state=KMEANS_RANDOM_STATE, n_init=KMEANS_N_INIT)
     labels1 = canonicalize_cluster_labels(km1.fit_predict(text_vectors))
-    macro_labels = compute_ctfidf_labels(texts, labels1, max_features=CTFIDF_MAX_FEATURES)
+    macro_labels = compute_cluster_frequency_labels(texts, labels1, top_n=1)
 
     semantic_ids: Dict[str, str] = {}
     semantic_texts: List[str] = []
+    generation_stats: Counter = Counter()
+    generation_stats["problem_count"] = len(problem_records)
+    generation_stats["macro_cluster_count"] = k1
     for cid in tqdm(range(k1), desc="strict semantic ids"):
         idxs = np.where(labels1 == cid)[0]
         if len(idxs) == 0:
             continue
         k2 = min(KLOCAL, len(idxs))
+        generation_stats["micro_cluster_total"] += k2
         sub_vectors = text_vectors[idxs]
         if k2 <= 1:
             labels2 = np.zeros((len(idxs),), dtype=np.int64)
@@ -213,15 +489,17 @@ def build_semantic_ids(
             km2 = KMeans(n_clusters=k2, random_state=KMEANS_RANDOM_STATE, n_init=KMEANS_N_INIT)
             labels2 = canonicalize_cluster_labels(km2.fit_predict(sub_vectors))
         sub_texts = [texts[int(idx)] for idx in idxs]
-        micro_labels = compute_ctfidf_labels(sub_texts, labels2, max_features=CTFIDF_MAX_FEATURES)
+        micro_labels = compute_cluster_frequency_labels(sub_texts, labels2, top_n=2)
         for local_pos, global_idx in enumerate(idxs):
             micro_label = micro_labels[int(labels2[local_pos])]
-            semantic_id = f"{macro_labels[cid]}-{micro_label}"
+            problem = problem_records[int(global_idx)]
+            semantic_id = _compose_semantic_id_with_stats(problem, macro_labels[cid], micro_label, generation_stats)
             semantic_ids[problem_ids[int(global_idx)]] = semantic_id
             semantic_texts.append(semantic_id)
 
     write_json(semantic_ids, semantic_ids_path)
-    return semantic_ids, [semantic_ids[pid] for pid in problem_ids]
+    audit_report = build_semantic_id_audit_report(problem_records, semantic_ids, generation_stats)
+    return semantic_ids, [semantic_ids[pid] for pid in problem_ids], audit_report
 
 
 def estimate_rasch_mu_q(
@@ -353,15 +631,22 @@ def build_collaborative_vectors(
     valid_problem_ids: Sequence[str],
     *,
     seed: int,
+    semantic_ids: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, List[str]], Dict[str, np.ndarray]]:
     valid_set = set(valid_problem_ids)
+    neighbors = build_jaccard_collaborative_neighbors(
+        student_sequences,
+        valid_problem_ids,
+        topk=5,
+        semantic_ids=semantic_ids,
+    )
     sentences: List[List[str]] = []
     for sequence in student_sequences:
         tokens = [str(log.get("problem_id") or "") for log in sequence.seq if str(log.get("problem_id") or "") in valid_set]
         if len(tokens) >= 2:
             sentences.append(tokens)
     if not sentences:
-        return {}, {}
+        return neighbors, {}
 
     model = Word2Vec(
         sentences=sentences,
@@ -374,12 +659,102 @@ def build_collaborative_vectors(
         epochs=5,
         seed=seed,
     )
-    neighbors: Dict[str, List[str]] = {}
     vectors: Dict[str, np.ndarray] = {}
     for pid in model.wv.index_to_key:
         vectors[pid] = model.wv[pid].astype(np.float32)
-        neighbors[pid] = [item for item, _score in model.wv.most_similar(pid, topn=5) if item != pid][:5]
     return neighbors, vectors
+
+
+def build_jaccard_collaborative_neighbors(
+    student_sequences: Sequence[StudentSequence],
+    valid_problem_ids: Sequence[str],
+    *,
+    topk: int = 5,
+    max_items_per_user: int = 200,
+    semantic_ids: Optional[Dict[str, str]] = None,
+) -> Dict[str, List[str]]:
+    valid_set = set(valid_problem_ids)
+    item_user_cnt: Counter = Counter()
+    neigh_inter_cnt: Dict[str, Counter] = defaultdict(Counter)
+
+    for sequence in tqdm(student_sequences, desc="strict collaborative jaccard"):
+        problems: List[str] = []
+        seen: set[str] = set()
+        for log in sequence.seq:
+            pid = str(log.get("problem_id") or "")
+            if not pid or pid not in valid_set or pid in seen:
+                continue
+            seen.add(pid)
+            problems.append(pid)
+            if len(problems) >= max_items_per_user:
+                break
+
+        for pid in problems:
+            item_user_cnt[pid] += 1
+        for i in range(len(problems)):
+            for j in range(i + 1, len(problems)):
+                left, right = problems[i], problems[j]
+                neigh_inter_cnt[left][right] += 1
+                neigh_inter_cnt[right][left] += 1
+
+    out: Dict[str, List[str]] = {}
+    for pid in valid_problem_ids:
+        scores: List[Tuple[float, str]] = []
+        for other, inter in neigh_inter_cnt.get(pid, {}).items():
+            union = item_user_cnt[pid] + item_user_cnt[other] - inter
+            if union <= 0:
+                continue
+            scores.append((float(inter) / float(union), other))
+        scores.sort(key=lambda item: (-item[0], item[1]))
+        out[pid] = [other for _score, other in scores[:topk]]
+    if semantic_ids:
+        out = fill_collaborative_neighbors_with_semantic_fallback(
+            out,
+            valid_problem_ids,
+            semantic_ids,
+            topk=topk,
+        )
+    return out
+
+
+def fill_collaborative_neighbors_with_semantic_fallback(
+    neighbors: Dict[str, List[str]],
+    valid_problem_ids: Sequence[str],
+    semantic_ids: Dict[str, str],
+    *,
+    topk: int,
+) -> Dict[str, List[str]]:
+    semantic_groups: Dict[str, List[str]] = defaultdict(list)
+    valid_set = set(valid_problem_ids)
+    for pid in valid_problem_ids:
+        semantic_id = str(semantic_ids.get(pid, "")).strip()
+        if semantic_id:
+            semantic_groups[semantic_id].append(pid)
+
+    filled: Dict[str, List[str]] = {}
+    for pid in valid_problem_ids:
+        current: List[str] = []
+        seen: set[str] = set()
+        for neighbor in neighbors.get(pid, []) or []:
+            neighbor = str(neighbor)
+            if neighbor == pid or neighbor not in valid_set or neighbor in seen:
+                continue
+            current.append(neighbor)
+            seen.add(neighbor)
+            if len(current) >= topk:
+                break
+
+        semantic_id = str(semantic_ids.get(pid, "")).strip()
+        if len(current) < topk and semantic_id:
+            for candidate in semantic_groups.get(semantic_id, []):
+                if candidate == pid or candidate in seen:
+                    continue
+                current.append(candidate)
+                seen.add(candidate)
+                if len(current) >= topk:
+                    break
+        filled[pid] = current
+    return filled
 
 
 def _collect_concept_stats(problem_records: Sequence[ProblemRecord]) -> Tuple[Dict[str, set[str]], Dict[Tuple[str, str], int]]:
@@ -461,38 +836,42 @@ def build_graph_bundle(
     *,
     llm_graph_completion: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    concept_to_chapters, local_counts = _collect_concept_stats(problem_records)
+    _concept_to_chapters, local_counts = _collect_concept_stats(problem_records)
 
-    concept_neighbors: Dict[str, set[str]] = defaultdict(set)
+    adjacency_scores: Dict[str, Counter] = defaultdict(Counter)
     local_edges: List[Dict[str, Any]] = []
     prerequisite_edges: List[Dict[str, Any]] = []
 
-    chapter_to_concepts: Dict[str, set[str]] = defaultdict(set)
-    for concept, chapters in concept_to_chapters.items():
-        for chapter in chapters:
-            chapter_to_concepts[chapter].add(concept)
-
-    for chapter, concepts in chapter_to_concepts.items():
-        ordered = sorted(concepts)
-        for i, left in enumerate(ordered):
-            for right in ordered[i + 1 :]:
-                concept_neighbors[left].add(right)
-                concept_neighbors[right].add(left)
-                local_edges.append({"src": left, "dst": right, "source": "chapter", "chapter": chapter})
-
+    low_count_candidates: Dict[str, Counter] = defaultdict(Counter)
     for (left, right), count in sorted(local_counts.items()):
+        low_count_candidates[left][right] = max(float(low_count_candidates[left][right]), float(count))
+        low_count_candidates[right][left] = max(float(low_count_candidates[right][left]), float(count))
         if count < LOCAL_COOCCUR_THRESHOLD:
             continue
-        concept_neighbors[left].add(right)
-        concept_neighbors[right].add(left)
+        adjacency_scores[left][right] = max(float(adjacency_scores[left][right]), float(count))
+        adjacency_scores[right][left] = max(float(adjacency_scores[right][left]), float(count))
         local_edges.append({"src": left, "dst": right, "source": "cofreq", "count": count})
+
+    min_cofreq_neighbors = 3
+    for concept, candidates in sorted(low_count_candidates.items()):
+        if len(adjacency_scores[concept]) >= min_cofreq_neighbors:
+            continue
+        ranked = sorted(candidates.items(), key=lambda item: (-float(item[1]), item[0]))
+        for neighbor, count in ranked:
+            if neighbor in adjacency_scores[concept]:
+                continue
+            adjacency_scores[concept][neighbor] = max(float(adjacency_scores[concept][neighbor]), float(count))
+            adjacency_scores[neighbor][concept] = max(float(adjacency_scores[neighbor][concept]), float(count))
+            local_edges.append({"src": concept, "dst": neighbor, "source": "cofreq_topk", "count": int(count)})
+            if len(adjacency_scores[concept]) >= min_cofreq_neighbors:
+                break
 
     llm_graph_completion = llm_graph_completion or {}
     for concept, payload in sorted(llm_graph_completion.items()):
         confidence = str(payload.get("confidence") or "低")
         for prereq in payload.get("prerequisite_candidates", []) or []:
-            concept_neighbors[concept].add(prereq)
-            concept_neighbors[prereq].add(concept)
+            adjacency_scores[concept][prereq] = max(float(adjacency_scores[concept][prereq]), 1_000_000.0)
+            adjacency_scores[prereq][concept] = max(float(adjacency_scores[prereq][concept]), 1_000_000.0)
             edge = {
                 "src": prereq,
                 "dst": concept,
@@ -502,8 +881,8 @@ def build_graph_bundle(
             prerequisite_edges.append(edge)
             local_edges.append(edge)
         for related in payload.get("related_candidates", []) or []:
-            concept_neighbors[concept].add(related)
-            concept_neighbors[related].add(concept)
+            adjacency_scores[concept][related] = max(float(adjacency_scores[concept][related]), 500_000.0)
+            adjacency_scores[related][concept] = max(float(adjacency_scores[related][concept]), 500_000.0)
             local_edges.append(
                 {
                     "src": concept,
@@ -513,19 +892,37 @@ def build_graph_bundle(
                 }
             )
 
+    max_concept_neighbors = 64
+    concept_neighbors: Dict[str, List[str]] = {}
+    for concept, scores in sorted(adjacency_scores.items()):
+        ranked = sorted(scores.items(), key=lambda item: (-float(item[1]), item[0]))
+        concept_neighbors[concept] = [neighbor for neighbor, _score in ranked[:max_concept_neighbors]]
+
+    max_problem_neighbor_concepts = 128
     problem_neighbor_concepts: Dict[str, List[str]] = {}
     for problem in problem_records:
-        neighbor_set = set()
+        neighbor_scores: Counter = Counter()
         for concept in problem.concepts:
-            neighbor_set.update(concept_neighbors.get(concept, set()))
-        neighbor_set.difference_update(problem.concepts)
-        problem_neighbor_concepts[problem.problem_id] = sorted(neighbor_set)
+            for rank, neighbor in enumerate(concept_neighbors.get(concept, [])):
+                if neighbor in problem.concepts:
+                    continue
+                neighbor_scores[neighbor] = max(float(neighbor_scores[neighbor]), 1.0 / float(rank + 1))
+        ranked_neighbors = sorted(neighbor_scores.items(), key=lambda item: (-float(item[1]), item[0]))
+        problem_neighbor_concepts[problem.problem_id] = [
+            neighbor for neighbor, _score in ranked_neighbors[:max_problem_neighbor_concepts]
+        ]
 
     return {
         "has_explicit_prerequisite": bool(prerequisite_edges),
         "e_pre": prerequisite_edges,
         "tau_localco": LOCAL_COOCCUR_THRESHOLD,
-        "concept_neighbors": {concept: sorted(neighbors) for concept, neighbors in sorted(concept_neighbors.items())},
+        "graph_policy": {
+            "chapter_clique_edges": False,
+            "min_cofreq_neighbors": min_cofreq_neighbors,
+            "max_concept_neighbors": max_concept_neighbors,
+            "max_problem_neighbor_concepts": max_problem_neighbor_concepts,
+        },
+        "concept_neighbors": concept_neighbors,
         "problem_neighbor_concepts": problem_neighbor_concepts,
         "local_edges": local_edges,
         "llm_graph_completion": llm_graph_completion,
@@ -824,6 +1221,100 @@ def save_pickle(data: Any, path: Path) -> None:
         pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
+def build_problem_catalog_records(
+    problem_records: Sequence[ProblemRecord],
+    semantic_ids: Dict[str, str],
+) -> List[ProblemCatalogRecord]:
+    return [
+        ProblemCatalogRecord(
+            problem_id=problem.problem_id,
+            semantic_id=semantic_ids[problem.problem_id],
+            text=problem.text,
+            title=problem.title,
+            chapter=problem.chapter,
+            location=problem.location,
+            cognitive_dimension=problem.cognitive_dimension,
+            concepts=problem.concepts,
+        )
+        for problem in problem_records
+    ]
+
+
+def run_stage32_core_artifacts(
+    *,
+    problem_json: Path,
+    student_json: Path,
+    priors_dir: Path,
+    smoke: bool = False,
+    text_embed_model: str = TEXT_EMBED_MODEL_NAME,
+    text_embed_batch_size: int = TEXT_EMBED_BATCH_SIZE,
+    text_embed_max_length: int = TEXT_EMBED_MAX_LENGTH,
+) -> Stage32CoreArtifactsResult:
+    ensure_dir(priors_dir)
+    problem_records = load_problem_records(
+        problem_json,
+        max_problems=SMOKE_MAX_PROBLEMS if smoke else None,
+    )
+    student_sequences = load_student_sequences(
+        student_json,
+        max_students=SMOKE_MAX_STUDENTS if smoke else None,
+        max_targets_per_student=SMOKE_MAX_TARGETS_PER_STUDENT if smoke else None,
+    )
+    if not problem_records:
+        raise ValueError("No problems loaded for strict stage 3.2 core artifacts")
+    if not student_sequences:
+        raise ValueError("No student sequences loaded for strict stage 3.2 core artifacts")
+
+    encoder = QwenEmbeddingEncoder(
+        model_name_or_path=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
+        device=pick_device(),
+        max_length=int(text_embed_max_length),
+        batch_size=int(text_embed_batch_size),
+    )
+    raw_texts = [problem.text or problem.title or problem.problem_id for problem in problem_records]
+    hqtext_vectors = encoder.encode_texts(
+        raw_texts,
+        instruction="Encode educational problem text for semantic clustering and downstream retrieval.",
+    )
+
+    semantic_ids_path = priors_dir / "semantic_ids.json"
+    semantic_ids, _semantic_id_texts, semantic_id_audit = build_semantic_ids(
+        problem_records,
+        hqtext_vectors,
+        semantic_ids_path=semantic_ids_path,
+    )
+    semantic_id_audit_path = priors_dir / "semantic_id_audit.json"
+    write_json(semantic_id_audit, semantic_id_audit_path)
+
+    collab_neighbors = build_jaccard_collaborative_neighbors(
+        student_sequences,
+        [problem.problem_id for problem in problem_records],
+        topk=5,
+        semantic_ids=semantic_ids,
+    )
+    item_collaborative_path = priors_dir / "item_collaborative.json"
+    write_json(collab_neighbors, item_collaborative_path)
+
+    problem_catalog_path = priors_dir / "problem_catalog.jsonl"
+    write_jsonl(
+        dataclass_list_to_jsonl(build_problem_catalog_records(problem_records, semantic_ids)),
+        problem_catalog_path,
+    )
+
+    manifest = Stage32CoreArtifactsResult(
+        priors_dir=str(priors_dir),
+        semantic_ids_path=str(semantic_ids_path),
+        semantic_id_audit_path=str(semantic_id_audit_path),
+        problem_catalog_path=str(problem_catalog_path),
+        item_collaborative_path=str(item_collaborative_path),
+        manifest_path=str(priors_dir / "stage32_core_artifacts_manifest.json"),
+        problem_count=len(problem_records),
+        student_count=len(student_sequences),
+    )
+    write_json(asdict(manifest), Path(manifest.manifest_path))
+    return manifest
+
+
 def run_stage32(
     *,
     problem_json: Path,
@@ -867,7 +1358,13 @@ def run_stage32(
     concept_groups = build_concept_groups(problem_records)
     hqtext_vectors = encoder.encode_texts(raw_texts, instruction="Encode educational problem text for semantic clustering and downstream retrieval.")
     semantic_ids_path = priors_dir / "semantic_ids.json"
-    semantic_ids, semantic_id_texts = build_semantic_ids(problem_records, hqtext_vectors, semantic_ids_path=semantic_ids_path)
+    semantic_ids, semantic_id_texts, semantic_id_audit = build_semantic_ids(
+        problem_records,
+        hqtext_vectors,
+        semantic_ids_path=semantic_ids_path,
+    )
+    semantic_id_audit_path = priors_dir / "semantic_id_audit.json"
+    write_json(semantic_id_audit, semantic_id_audit_path)
     hqid_vectors = encoder.encode_texts(
         semantic_id_texts,
         instruction="Encode hierarchical semantic identifiers for educational problem semantics.",
@@ -911,6 +1408,7 @@ def run_stage32(
         student_sequences,
         [problem.problem_id for problem in problem_records],
         seed=seed,
+        semantic_ids=semantic_ids,
     )
     graph_completer = None
     if enable_llm_graph_completion:
@@ -944,19 +1442,7 @@ def run_stage32(
     write_json(collab_neighbors, priors_dir / "item_collaborative.json")
     write_json(graph_bundle, priors_dir / "concept_graph_bundle.json")
 
-    catalog_records = [
-        ProblemCatalogRecord(
-            problem_id=problem.problem_id,
-            semantic_id=semantic_ids[problem.problem_id],
-            text=problem.text,
-            title=problem.title,
-            chapter=problem.chapter,
-            location=problem.location,
-            cognitive_dimension=problem.cognitive_dimension,
-            concepts=problem.concepts,
-        )
-        for problem in problem_records
-    ]
+    catalog_records = build_problem_catalog_records(problem_records, semantic_ids)
     problem_catalog_path = priors_dir / "problem_catalog.jsonl"
     write_jsonl(dataclass_list_to_jsonl(catalog_records), problem_catalog_path)
 
@@ -983,6 +1469,13 @@ def run_stage32(
         "tau": TAU,
         "epsilon": EPS,
         "smoke": smoke,
+        "semantic_id_cleaning": {
+            "extra_stopword_count": len(SEMANTIC_EXTRA_STOP_WORDS),
+            "placeholder_rule": "drop underscore-only and blank-like tokens",
+            "duplicate_collapse": True,
+            "fallback_order_macro": "chapter -> concepts -> title -> text",
+            "fallback_order_micro": "concepts -> title -> text -> chapter",
+        },
     }
     implementation_defaults_path = priors_dir / "implementation_defaults.json"
     write_json(implementation_defaults, implementation_defaults_path)
@@ -990,6 +1483,7 @@ def run_stage32(
     manifest = Stage32Result(
         priors_dir=str(priors_dir),
         semantic_ids_path=str(priors_dir / "semantic_ids.json"),
+        semantic_id_audit_path=str(semantic_id_audit_path),
         semantic_vectors_path=str(priors_dir / "semantic_vectors.pkl"),
         hqtext_vectors_path=str(priors_dir / "hqtext_vectors.pkl"),
         hqid_vectors_path=str(priors_dir / "hqid_vectors.pkl"),

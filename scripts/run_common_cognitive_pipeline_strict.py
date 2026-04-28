@@ -18,8 +18,6 @@ from common_pipeline_strict.constants import (
     USE_QWEN_RERANKER,
 )
 from common_pipeline_strict.io_utils import ensure_dir
-from common_pipeline_strict.stage32 import run_stage32
-from common_pipeline_strict.stage34 import run_stage34
 
 
 def main() -> None:
@@ -34,6 +32,7 @@ def main() -> None:
     parser.add_argument("--preview_limit", type=int, default=50)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--skip_stage32", action="store_true")
+    parser.add_argument("--stage32_core_artifacts_only", action="store_true")
     parser.add_argument("--text_embed_model", type=str, default=TEXT_EMBED_MODEL_NAME)
     parser.add_argument("--text_embed_batch_size", type=int, default=TEXT_EMBED_BATCH_SIZE)
     parser.add_argument("--text_embed_max_length", type=int, default=TEXT_EMBED_MAX_LENGTH)
@@ -65,12 +64,34 @@ def main() -> None:
     reports_dir = ensure_dir(out_root / "reports")
     cache_dir = ensure_dir(out_root / "cache")
 
+    if args.stage32_core_artifacts_only:
+        from common_pipeline_strict.stage32 import run_stage32_core_artifacts
+
+        result = run_stage32_core_artifacts(
+            problem_json=Path(args.problem_json).resolve(),
+            student_json=Path(args.student_json).resolve(),
+            priors_dir=priors_dir,
+            smoke=bool(args.smoke),
+            text_embed_model=str(args.text_embed_model),
+            text_embed_batch_size=int(args.text_embed_batch_size),
+            text_embed_max_length=int(args.text_embed_max_length),
+        )
+        print("[OK] strict stage32 core artifacts finished")
+        print("[SEMANTIC_IDS]", result.semantic_ids_path)
+        print("[SEMANTIC_AUDIT]", result.semantic_id_audit_path)
+        print("[PROBLEM_CATALOG]", result.problem_catalog_path)
+        print("[ITEM_COLLABORATIVE]", result.item_collaborative_path)
+        print("[MANIFEST]", result.manifest_path)
+        return
+
     if args.skip_stage32:
         stage32_manifest = priors_dir / "stage32_manifest.json"
         if not stage32_manifest.exists():
             raise FileNotFoundError(f"--skip_stage32 was set but {stage32_manifest} does not exist")
         stage32 = type("Stage32ResultStub", (), {"manifest_path": str(stage32_manifest)})()
     else:
+        from common_pipeline_strict.stage32 import run_stage32
+
         stage32 = run_stage32(
             problem_json=Path(args.problem_json).resolve(),
             student_json=Path(args.student_json).resolve(),
@@ -88,6 +109,8 @@ def main() -> None:
             llm_max_tokens=int(args.llm_max_tokens),
             llm_temperature=float(args.llm_temperature),
         )
+    from common_pipeline_strict.stage34 import run_stage34
+
     stage34 = run_stage34(
         problem_json=Path(args.problem_json).resolve(),
         student_json=Path(args.student_json).resolve(),
@@ -123,6 +146,8 @@ def main() -> None:
 
     print("[OK] strict common pipeline finished")
     print("[PRIORS]", stage32.manifest_path)
+    if getattr(stage32, "semantic_id_audit_path", None):
+        print("[SEMANTIC_AUDIT]", stage32.semantic_id_audit_path)
     print("[CONTEXTS]", stage34.contexts_path)
     print("[PREVIEW]", stage34.preview_path)
     if stage34.embeddings_path:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
+import os
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -147,7 +149,7 @@ def split_dataset(dataset, train_ratio: float, seed: int, split_dir: Path) -> Tu
     return Subset(dataset, train_indices), Subset(dataset, test_indices), split_stats
 
 
-def evaluate(model, loader, device: str, model_name: str, context_type: str) -> Dict[str, float]:
+def evaluate(model, loader, device: str, model_name: str, context_type: str, amp_enabled: bool = False) -> Dict[str, float]:
     model.eval()
     preds = []
     targets = []
@@ -165,12 +167,13 @@ def evaluate(model, loader, device: str, model_name: str, context_type: str) -> 
             if ctx is not None:
                 ctx = ctx.to(device, non_blocking=True)
 
-            p = model(q.long(), r.long(), qshft.long(), ctx)
-            p = torch.masked_select(p, mask)
-            t = torch.masked_select(rshft.float(), mask)
-            if p.numel() == 0:
-                continue
-            loss = binary_cross_entropy(p, t)
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                p = model(q.long(), r.long(), qshft.long(), ctx)
+                p = torch.masked_select(p, mask)
+                t = torch.masked_select(rshft.float(), mask)
+                if p.numel() == 0:
+                    continue
+            loss = binary_cross_entropy(p.float(), t.float())
             losses.append(float(loss.detach().cpu().item()))
             preds.append(p.detach().cpu())
             targets.append(t.detach().cpu())
@@ -198,12 +201,29 @@ def evaluate(model, loader, device: str, model_name: str, context_type: str) -> 
     return metrics_out
 
 
-def train(model, train_loader, valid_loader, optimizer, num_epochs: int, device: str, model_name: str, context_type: str, ckpt_dir: Path):
+def train(
+    model,
+    train_loader,
+    valid_loader,
+    optimizer,
+    num_epochs: int,
+    device: str,
+    model_name: str,
+    context_type: str,
+    ckpt_dir: Path,
+    patience: int = 0,
+    eval_interval: int = 1,
+    amp_enabled: bool = False,
+):
     history = []
     best_auc = -1.0
+    best_epoch = -1
     best_metrics: Dict[str, float] | None = None
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_path = ckpt_dir / "model.ckpt"
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    eval_interval = max(1, int(eval_interval))
+    patience = max(0, int(patience))
 
     for epoch in range(1, num_epochs + 1):
         model.train()
@@ -221,16 +241,17 @@ def train(model, train_loader, valid_loader, optimizer, num_epochs: int, device:
             if ctx is not None:
                 ctx = ctx.to(device, non_blocking=True)
 
-            p = model(q.long(), r.long(), qshft.long(), ctx)
-            p = torch.masked_select(p, mask)
-            t = torch.masked_select(rshft.float(), mask)
-            if p.numel() == 0:
-                continue
-
             optimizer.zero_grad()
-            loss = binary_cross_entropy(p, t)
-            loss.backward()
-            optimizer.step()
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                p = model(q.long(), r.long(), qshft.long(), ctx)
+                p = torch.masked_select(p, mask)
+                t = torch.masked_select(rshft.float(), mask)
+                if p.numel() == 0:
+                    continue
+            loss = binary_cross_entropy(p.float(), t.float())
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             loss_value = float(loss.detach().cpu().item())
             batch_losses.append(loss_value)
@@ -238,13 +259,28 @@ def train(model, train_loader, valid_loader, optimizer, num_epochs: int, device:
 
         train_loss = float(np.mean(batch_losses)) if batch_losses else 0.0
         train_context_fusion = get_context_fusion_stats(model)
-        eval_metrics = evaluate(model, valid_loader, device, model_name, context_type)
+        should_eval = (epoch % eval_interval == 0) or (epoch == num_epochs)
+        if not should_eval:
+            history.append(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "train_context_fusion": train_context_fusion,
+                    "eval_metrics": None,
+                    "skipped_eval": True,
+                }
+            )
+            print(f"Epoch: {epoch}, Train Loss: {train_loss:.6f}, Valid: skipped")
+            continue
+
+        eval_metrics = evaluate(model, valid_loader, device, model_name, context_type, amp_enabled=amp_enabled)
         history.append(
             {
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "train_context_fusion": train_context_fusion,
                 "eval_metrics": eval_metrics,
+                "skipped_eval": False,
             }
         )
         train_gate_summary = ""
@@ -291,8 +327,12 @@ def train(model, train_loader, valid_loader, optimizer, num_epochs: int, device:
         eval_auc = float(eval_metrics["auc"])
         if not math.isnan(eval_auc) and eval_auc > best_auc:
             best_auc = eval_auc
+            best_epoch = epoch
             best_metrics = dict(eval_metrics)
             torch.save(model.state_dict(), best_path)
+        if patience > 0 and best_epoch > 0 and epoch - best_epoch >= patience:
+            print(f"Early stopping at epoch {epoch}; best_epoch={best_epoch}, best_valid_auc={best_auc:.6f}")
+            break
 
     if best_metrics is None:
         best_metrics = {
@@ -340,10 +380,27 @@ def main() -> None:
     parser.add_argument("--test_concept_ratio", type=float, default=0.2)
     parser.add_argument("--valid_ratio", type=float, default=0.1)
     parser.add_argument("--cache_dataset", action="store_true")
+    parser.add_argument("--eval_only", action="store_true")
+    parser.add_argument("--eval_ckpt", type=str, default=None)
+    parser.add_argument("--cpu_threads", type=int, default=None)
+    parser.add_argument("--context_storage_dtype", type=str, default="float32", choices=["float32", "float16"])
+    parser.add_argument("--patience", type=int, default=0)
+    parser.add_argument("--eval_interval", type=int, default=1)
+    parser.add_argument("--amp", action="store_true")
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--num_epochs", type=int, default=None)
     args = parser.parse_args()
+
+    if args.cpu_threads is not None:
+        cpu_threads = max(1, int(args.cpu_threads))
+        for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            os.environ[name] = str(cpu_threads)
+        torch.set_num_threads(cpu_threads)
+        try:
+            torch.set_num_interop_threads(cpu_threads)
+        except RuntimeError:
+            pass
 
     with (workspace / "models" / "config.json").open("r", encoding="utf-8") as f:
         config = json.load(f)
@@ -369,7 +426,85 @@ def main() -> None:
         "seed": int(args.seed),
         "test_concept_ratio": float(args.test_concept_ratio),
         "cache_preprocessed": (args.split_mode == "user" or args.cache_dataset),
+        "context_storage_dtype": args.context_storage_dtype,
     }
+
+    if args.eval_only:
+        eval_role = "test" if args.split_mode == "new_concept" else "all"
+        dataset = MOOCRadarStrict(**dataset_kwargs, split_role=eval_role)
+        if args.context_type == "llm" and not dataset.has_llm_context:
+            raise ValueError("Requested context_type=llm but context_embeddings.pkl does not contain llm_embeddings")
+        if args.context_type == "llm" and not getattr(dataset, "has_llm_struct_context", False):
+            raise ValueError("Requested context_type=llm but context_embeddings.pkl does not contain llm_struct_embeddings")
+        if args.context_type == "llm" and not getattr(dataset, "has_llm_struct_feature_context", False):
+            raise ValueError("Requested context_type=llm but context_embeddings.pkl does not contain llm_struct_features")
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        amp_enabled = bool(args.amp and device == "cuda")
+        effective_num_workers = int(args.num_workers) if args.num_workers is not None else (0 if args.context_type == "llm" else 4)
+        effective_batch_size = int(train_config["batch_size"])
+        if args.model_name in ("sakt", "saint"):
+            model_config["n"] = seq_len
+        ckpt_dir = Path(args.ckpt_root).resolve() / args.split_mode / args.model_name / args.context_type / args.fusion_type
+        ckpt_path = Path(args.eval_ckpt).resolve() if args.eval_ckpt else ckpt_dir / "model.ckpt"
+        if not ckpt_path.exists():
+            raise FileNotFoundError(ckpt_path)
+
+        model = build_model(args.model_name, dataset, model_config, args.fusion_type, args.context_type).to(device)
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        eval_loader = DataLoader(
+            dataset,
+            batch_size=effective_batch_size,
+            shuffle=False,
+            collate_fn=collate_fn_with_context,
+            num_workers=max(0, effective_num_workers),
+            pin_memory=(device == "cuda"),
+            persistent_workers=(effective_num_workers > 0),
+        )
+        test_metrics = evaluate(model, eval_loader, device, args.model_name, args.context_type, amp_enabled=amp_enabled)
+        metrics_path = ckpt_dir / "metrics.json"
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        with metrics_path.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "model_name": args.model_name,
+                    "context_type": args.context_type,
+                    "split_mode": args.split_mode,
+                    "eval_only": True,
+                    "device": device,
+                    "cpu_threads": args.cpu_threads,
+                    "context_storage_dtype": args.context_storage_dtype,
+                    "amp": amp_enabled,
+                    "test_len": len(dataset),
+                    "split_stats": {
+                        "split_mode": args.split_mode,
+                        "test_dataset_stats": getattr(dataset, "split_stats", {}),
+                    },
+                    "context_dim": dataset.context_dim,
+                    "has_llm_context": dataset.has_llm_context,
+                    "has_llm_struct_context": getattr(dataset, "has_llm_struct_context", False),
+                    "llm_struct_dim": getattr(dataset, "llm_struct_dim", 0),
+                    "has_llm_struct_feature_context": getattr(dataset, "has_llm_struct_feature_context", False),
+                    "llm_struct_feature_dim": getattr(dataset, "llm_struct_feature_dim", 0),
+                    "fusion_type": args.fusion_type,
+                    "test_metrics": test_metrics,
+                    "best_ckpt": str(ckpt_path),
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        print("[OK] eval-only finished")
+        print("[MODEL]", args.model_name)
+        print("[CONTEXT]", args.context_type)
+        print("[FUSION]", args.fusion_type)
+        print("[SPLIT_MODE]", args.split_mode)
+        print("[TEST_AUC]", test_metrics.get("auc"))
+        print("[TEST_ACC]", test_metrics.get("acc"))
+        print("[METRICS]", metrics_path)
+        return
+
     if args.split_mode == "new_concept":
         dataset = MOOCRadarStrict(**dataset_kwargs, split_role="train_valid")
         final_test_dataset = None
@@ -384,12 +519,15 @@ def main() -> None:
         raise ValueError("Requested context_type=llm but context_embeddings.pkl does not contain llm_struct_features")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    amp_enabled = bool(args.amp and device == "cuda")
     effective_num_workers = int(args.num_workers) if args.num_workers is not None else (0 if args.context_type == "llm" else 4)
     effective_batch_size = int(train_config["batch_size"])
     print(
         f"[train_context] model={args.model_name} context_type={args.context_type} "
         f"split_mode={args.split_mode} "
         f"batch_size={effective_batch_size} num_workers={effective_num_workers} "
+        f"cpu_threads={args.cpu_threads} context_storage_dtype={args.context_storage_dtype} "
+        f"patience={args.patience} eval_interval={args.eval_interval} amp={amp_enabled} "
         f"context_dim={dataset.context_dim} llm_struct_dim={getattr(dataset, 'llm_struct_dim', 0)} "
         f"llm_struct_feature_dim={getattr(dataset, 'llm_struct_feature_dim', 0)}",
         flush=True,
@@ -452,13 +590,34 @@ def main() -> None:
         args.model_name,
         args.context_type,
         ckpt_dir,
+        patience=int(args.patience),
+        eval_interval=int(args.eval_interval),
+        amp_enabled=amp_enabled,
     )
+    train_valid_dataset_len = len(dataset)
+    train_len = len(train_dataset)
+    valid_len = len(valid_dataset)
+    context_info = {
+        "context_dim": dataset.context_dim,
+        "has_llm_context": dataset.has_llm_context,
+        "has_llm_struct_context": getattr(dataset, "has_llm_struct_context", False),
+        "llm_struct_dim": getattr(dataset, "llm_struct_dim", 0),
+        "has_llm_struct_feature_context": getattr(dataset, "has_llm_struct_feature_context", False),
+        "llm_struct_feature_dim": getattr(dataset, "llm_struct_feature_dim", 0),
+    }
     if best_path.exists():
         model.load_state_dict(torch.load(best_path, map_location=device))
+    reuse_valid_as_test = args.split_mode != "new_concept"
+    if reuse_valid_as_test:
+        final_test_dataset = valid_dataset
+        del train_loader, valid_loader, train_dataset, dataset, optimizer
+    else:
+        del train_loader, valid_loader, train_dataset, valid_dataset, dataset, optimizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     if args.split_mode == "new_concept":
         final_test_dataset = MOOCRadarStrict(**dataset_kwargs, split_role="test")
-    else:
-        final_test_dataset = valid_dataset
     split_stats["test_dataset_stats"] = getattr(final_test_dataset, "split_stats", {})
     test_loader = DataLoader(
         final_test_dataset,
@@ -469,7 +628,7 @@ def main() -> None:
         pin_memory=(device == "cuda"),
         persistent_workers=(effective_num_workers > 0),
     )
-    test_metrics = evaluate(model, test_loader, device, args.model_name, args.context_type)
+    test_metrics = evaluate(model, test_loader, device, args.model_name, args.context_type, amp_enabled=amp_enabled)
 
     metrics_path = ckpt_dir / "metrics.json"
     with metrics_path.open("w", encoding="utf-8") as f:
@@ -479,17 +638,17 @@ def main() -> None:
                 "context_type": args.context_type,
                 "split_mode": args.split_mode,
                 "device": device,
-                "train_valid_dataset_len": len(dataset),
-                "train_len": len(train_dataset),
-                "valid_len": len(valid_dataset),
+                "cpu_threads": args.cpu_threads,
+                "context_storage_dtype": args.context_storage_dtype,
+                "patience": int(args.patience),
+                "eval_interval": int(args.eval_interval),
+                "amp": amp_enabled,
+                "train_valid_dataset_len": train_valid_dataset_len,
+                "train_len": train_len,
+                "valid_len": valid_len,
                 "test_len": len(final_test_dataset),
                 "split_stats": split_stats,
-                "context_dim": dataset.context_dim,
-                "has_llm_context": dataset.has_llm_context,
-                "has_llm_struct_context": getattr(dataset, "has_llm_struct_context", False),
-                "llm_struct_dim": getattr(dataset, "llm_struct_dim", 0),
-                "has_llm_struct_feature_context": getattr(dataset, "has_llm_struct_feature_context", False),
-                "llm_struct_feature_dim": getattr(dataset, "llm_struct_feature_dim", 0),
+                **context_info,
                 "fusion_type": args.fusion_type,
                 "best_valid_auc": best_auc,
                 "best_valid_metrics": best_metrics,

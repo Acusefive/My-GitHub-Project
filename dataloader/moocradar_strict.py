@@ -67,23 +67,23 @@ def match_seq_len_with_context(
         proc_r.append(np.concatenate([r_seq[i:], np.full((pad_count,), pad_val, dtype=np.int64)], axis=0))
         proc_eval_masks.append(np.concatenate([eval_mask_seq[i:], np.zeros((pad_count,), dtype=np.int64)], axis=0))
         proc_ctx_main.append(
-            np.concatenate([ctx_main_seq[i:], np.zeros((pad_count, ctx_main_seq.shape[1]), dtype=np.float32)], axis=0)
+            np.concatenate([ctx_main_seq[i:], np.zeros((pad_count, ctx_main_seq.shape[1]), dtype=ctx_main_seq.dtype)], axis=0)
         )
         proc_ctx_tpl.append(
-            np.concatenate([ctx_tpl_seq[i:], np.zeros((pad_count, ctx_tpl_seq.shape[1]), dtype=np.float32)], axis=0)
+            np.concatenate([ctx_tpl_seq[i:], np.zeros((pad_count, ctx_tpl_seq.shape[1]), dtype=ctx_tpl_seq.dtype)], axis=0)
         )
         proc_ctx_llm.append(
-            np.concatenate([ctx_llm_seq[i:], np.zeros((pad_count, ctx_llm_seq.shape[1]), dtype=np.float32)], axis=0)
+            np.concatenate([ctx_llm_seq[i:], np.zeros((pad_count, ctx_llm_seq.shape[1]), dtype=ctx_llm_seq.dtype)], axis=0)
         )
         proc_ctx_llm_struct.append(
             np.concatenate(
-                [ctx_llm_struct_seq[i:], np.zeros((pad_count, ctx_llm_struct_seq.shape[1]), dtype=np.float32)],
+                [ctx_llm_struct_seq[i:], np.zeros((pad_count, ctx_llm_struct_seq.shape[1]), dtype=ctx_llm_struct_seq.dtype)],
                 axis=0,
             )
         )
         proc_ctx_llm_struct_features.append(
             np.concatenate(
-                [ctx_llm_struct_feature_seq[i:], np.zeros((pad_count, ctx_llm_struct_feature_seq.shape[1]), dtype=np.float32)],
+                [ctx_llm_struct_feature_seq[i:], np.zeros((pad_count, ctx_llm_struct_feature_seq.shape[1]), dtype=ctx_llm_struct_feature_seq.dtype)],
                 axis=0,
             )
         )
@@ -119,6 +119,7 @@ class MOOCRadarStrict(Dataset):
         seed: int = 42,
         test_concept_ratio: float = 0.2,
         cache_preprocessed: bool = True,
+        context_storage_dtype: str = "float32",
     ) -> None:
         super().__init__()
 
@@ -135,6 +136,9 @@ class MOOCRadarStrict(Dataset):
         self.seed = int(seed)
         self.test_concept_ratio = float(test_concept_ratio)
         self.cache_preprocessed = bool(cache_preprocessed)
+        if context_storage_dtype not in {"float32", "float16"}:
+            raise ValueError(f"Unsupported context_storage_dtype: {context_storage_dtype}")
+        self.context_storage_dtype = np.float16 if context_storage_dtype == "float16" else np.float32
         if self.split_mode not in {"user", "new_concept"}:
             raise ValueError(f"Unsupported split_mode: {self.split_mode}")
         if self.split_mode == "new_concept" and self.split_role not in {"train_valid", "test"}:
@@ -144,7 +148,7 @@ class MOOCRadarStrict(Dataset):
         context_tag = f"{self.context_embeddings_path.stem}_{self.context_embeddings_path.stat().st_size}"
         split_tag = (
             f"{self.split_mode}_{self.split_role}_seq{self.seq_len}_seed{self.seed}_"
-            f"ratio{str(self.test_concept_ratio).replace('.', 'p')}"
+            f"ratio{str(self.test_concept_ratio).replace('.', 'p')}_ctx{context_storage_dtype}"
         )
         cache_prefix = self.dataset_dir / f"moocradar_strict_{context_tag}_{split_tag}"
         base_cache = {
@@ -170,7 +174,10 @@ class MOOCRadarStrict(Dataset):
             "split_stats": cache_prefix.with_name(cache_prefix.name + "_split_stats.pkl"),
         }
 
-        if self.cache_preprocessed and all(path.exists() for path in base_cache.values()):
+        self.lazy_test = self.split_mode == "new_concept" and self.split_role == "test"
+        if self.lazy_test:
+            self._preprocess_lazy_test()
+        elif self.cache_preprocessed and all(path.exists() for path in base_cache.values()):
             self.q_seqs = pickle.loads(base_cache["q_seqs"].read_bytes())
             self.r_seqs = pickle.loads(base_cache["r_seqs"].read_bytes())
             self.eval_mask_seqs = pickle.loads(base_cache["eval_mask_seqs"].read_bytes())
@@ -221,6 +228,11 @@ class MOOCRadarStrict(Dataset):
         self.num_u = int(len(self.u_list))
         self.num_q = int(len(self.q_list))
 
+        if self.lazy_test:
+            self.sample_user_ids = list(self.lazy_sample_user_ids)
+            self.len = len(self.test_samples)
+            return
+
         if self.seq_len:
             (
                 self.q_seqs,
@@ -250,6 +262,8 @@ class MOOCRadarStrict(Dataset):
         self.len = len(self.q_seqs)
 
     def __getitem__(self, index):
+        if getattr(self, "lazy_test", False):
+            return self._get_lazy_test_item(index)
         return (
             self.q_seqs[index],
             self.r_seqs[index],
@@ -276,11 +290,11 @@ class MOOCRadarStrict(Dataset):
     ):
         q_seq = np.asarray([q2idx[str(log["problem_id"])] for _, log in log_items], dtype=np.int64)
         r_seq = np.asarray([int(log.get("is_correct") or 0) for _, log in log_items], dtype=np.int64)
-        ctx_main_seq = np.zeros((len(log_items), context_map.context_dim), dtype=np.float32)
-        ctx_tpl_seq = np.zeros((len(log_items), context_map.context_dim), dtype=np.float32)
-        ctx_llm_seq = np.zeros((len(log_items), context_map.context_dim), dtype=np.float32)
-        ctx_llm_struct_seq = np.zeros((len(log_items), context_map.llm_struct_dim), dtype=np.float32)
-        ctx_llm_struct_feature_seq = np.zeros((len(log_items), context_map.llm_struct_feature_dim), dtype=np.float32)
+        ctx_main_seq = np.zeros((len(log_items), context_map.context_dim), dtype=self.context_storage_dtype)
+        ctx_tpl_seq = np.zeros((len(log_items), context_map.context_dim), dtype=self.context_storage_dtype)
+        ctx_llm_seq = np.zeros((len(log_items), context_map.context_dim), dtype=self.context_storage_dtype)
+        ctx_llm_struct_seq = np.zeros((len(log_items), context_map.llm_struct_dim), dtype=self.context_storage_dtype)
+        ctx_llm_struct_feature_seq = np.zeros((len(log_items), context_map.llm_struct_feature_dim), dtype=self.context_storage_dtype)
 
         for pos, (target_t, log) in enumerate(log_items):
             if pos == 0:
@@ -334,6 +348,165 @@ class MOOCRadarStrict(Dataset):
         ctx_llm_struct_feature_seqs.append(ctx_llm_struct_feature_seq)
         seq_user_ids.append(user_id)
 
+    def _preprocess_lazy_test(self) -> None:
+        problem_records = load_problem_records(self.problem_json)
+        student_sequences = load_student_sequences(self.student_json)
+        self.context_map = ContextEmbeddingMap(self.context_embeddings_path)
+
+        self.q_list = np.asarray(sorted({problem.problem_id for problem in problem_records}))
+        self.u_list = np.asarray([sequence.user_id for sequence in student_sequences])
+        self.q2idx = {pid: idx for idx, pid in enumerate(self.q_list.tolist())}
+        self.u2idx = {uid: idx for idx, uid in enumerate(self.u_list.tolist())}
+        pid2concepts = {problem.problem_id: set(problem.concepts) for problem in problem_records}
+
+        self.context_dim = self.context_map.context_dim
+        self.has_llm_context = self.context_map.has_llm
+        self.llm_struct_dim = self.context_map.llm_struct_dim
+        self.has_llm_struct_context = self.context_map.has_llm_struct
+        self.llm_struct_feature_dim = self.context_map.llm_struct_feature_dim
+        self.has_llm_struct_feature_context = self.context_map.has_llm_struct_features
+        self.zero_ctx = np.zeros((self.context_dim,), dtype=self.context_storage_dtype)
+        self.zero_struct_ctx = np.zeros((self.llm_struct_dim,), dtype=self.context_storage_dtype)
+        self.zero_struct_feature_ctx = np.zeros((self.llm_struct_feature_dim,), dtype=self.context_storage_dtype)
+
+        all_concepts = sorted({concept for concepts in pid2concepts.values() for concept in concepts})
+        rng = np.random.default_rng(self.seed)
+        shuffled_concepts = np.asarray(all_concepts, dtype=object)
+        if len(shuffled_concepts) > 0:
+            shuffled_concepts = shuffled_concepts[rng.permutation(len(shuffled_concepts))]
+        test_concept_count = max(1, int(len(shuffled_concepts) * self.test_concept_ratio)) if len(shuffled_concepts) else 0
+        test_concepts = set(shuffled_concepts[:test_concept_count].tolist())
+        train_concepts = set(all_concepts) - test_concepts
+
+        self.lazy_sequences = []
+        self.test_samples = []
+        self.lazy_sample_user_ids = []
+        train_target_concepts = set()
+        test_target_concepts = set()
+        skipped_test_targets_no_old_history = 0
+        train_target_interactions = 0
+        test_target_interactions = 0
+
+        for sequence in student_sequences:
+            raw_filtered_logs = [log for log in sequence.seq if str(log.get("problem_id") or "") in self.q2idx]
+            if len(raw_filtered_logs) < 2:
+                continue
+
+            pids = [str(log["problem_id"]) for log in raw_filtered_logs]
+            qids = np.asarray([self.q2idx[pid] for pid in pids], dtype=np.int64)
+            responses = np.asarray([int(log.get("is_correct") or 0) for log in raw_filtered_logs], dtype=np.int64)
+            target_ts = np.arange(len(raw_filtered_logs), dtype=np.int64)
+            is_test_target = np.zeros((len(raw_filtered_logs),), dtype=bool)
+            old_mask = np.zeros((len(raw_filtered_logs),), dtype=bool)
+            has_old_history = False
+            user_idx = len(self.lazy_sequences)
+
+            for pos, pid in enumerate(pids):
+                concepts = pid2concepts.get(pid, set())
+                if concepts & test_concepts:
+                    is_test_target[pos] = True
+                    test_target_concepts.update(concepts & test_concepts)
+                    test_target_interactions += 1
+                    if not has_old_history:
+                        skipped_test_targets_no_old_history += 1
+                        continue
+                    self.test_samples.append((user_idx, pos))
+                    self.lazy_sample_user_ids.append(sequence.user_id)
+                else:
+                    old_mask[pos] = True
+                    has_old_history = True
+                    train_target_concepts.update(concepts & train_concepts)
+                    train_target_interactions += 1
+
+            self.lazy_sequences.append(
+                {
+                    "user_id": sequence.user_id,
+                    "pids": pids,
+                    "qids": qids,
+                    "responses": responses,
+                    "target_ts": target_ts,
+                    "old_mask": old_mask,
+                    "is_test_target": is_test_target,
+                }
+            )
+
+        self.split_stats = {
+            "split_mode": self.split_mode,
+            "split_role": self.split_role,
+            "lazy_test": True,
+            "seed": self.seed,
+            "test_concept_ratio": self.test_concept_ratio,
+            "total_concepts": len(all_concepts),
+            "configured_train_concepts": len(train_concepts),
+            "configured_test_concepts": len(test_concepts),
+            "train_target_concepts": len(train_target_concepts),
+            "test_target_concepts": len(test_target_concepts),
+            "train_test_concept_overlap": len(train_target_concepts & test_target_concepts),
+            "train_target_interactions": train_target_interactions,
+            "test_target_interactions": test_target_interactions,
+            "skipped_test_targets_no_old_history": skipped_test_targets_no_old_history,
+            "sequence_count": len(self.test_samples),
+        }
+
+    def _get_lazy_test_item(self, index):
+        user_idx, target_pos = self.test_samples[index]
+        record = self.lazy_sequences[user_idx]
+        positions = []
+        pos = int(target_pos) - 1
+        while pos >= 0 and len(positions) < self.seq_len:
+            if bool(record["old_mask"][pos]):
+                positions.append(pos)
+            pos -= 1
+        positions.reverse()
+        positions.append(int(target_pos))
+
+        q_seq = np.asarray([record["qids"][pos] for pos in positions], dtype=np.int64)
+        r_seq = np.asarray([record["responses"][pos] for pos in positions], dtype=np.int64)
+        eval_mask = np.zeros((len(positions),), dtype=np.int64)
+        eval_mask[-1] = 1
+
+        ctx_main_seq = np.zeros((len(positions), self.context_dim), dtype=self.context_storage_dtype)
+        ctx_tpl_seq = np.zeros((len(positions), self.context_dim), dtype=self.context_storage_dtype)
+        ctx_llm_seq = np.zeros((len(positions), self.context_dim), dtype=self.context_storage_dtype)
+        ctx_llm_struct_seq = np.zeros((len(positions), self.llm_struct_dim), dtype=self.context_storage_dtype)
+        ctx_llm_struct_feature_seq = np.zeros((len(positions), self.llm_struct_feature_dim), dtype=self.context_storage_dtype)
+
+        user_id = record["user_id"]
+        for out_pos, src_pos in enumerate(positions):
+            if out_pos == 0:
+                continue
+            pid = record["pids"][src_pos]
+            key = (user_id, int(record["target_ts"][src_pos]), pid)
+            main_value = self.context_map.get_main(key)
+            tpl_value = self.context_map.get_template(key)
+            llm_value = self.context_map.get_llm(key)
+            llm_struct_value = self.context_map.get_llm_struct(key)
+            llm_struct_feature_value = self.context_map.get_llm_struct_features(key)
+            ctx_main_seq[out_pos] = main_value if main_value is not None else self.zero_ctx
+            ctx_tpl_seq[out_pos] = tpl_value if tpl_value is not None else self.zero_ctx
+            if self.require_llm_context and llm_value is None:
+                raise ValueError(f"Missing llm context embedding for {key}")
+            if self.require_llm_struct_context and llm_struct_value is None:
+                raise ValueError(f"Missing llm structured embedding for {key}")
+            if self.require_llm_struct_feature_context and llm_struct_feature_value is None:
+                raise ValueError(f"Missing llm structured feature vector for {key}")
+            ctx_llm_seq[out_pos] = llm_value if llm_value is not None else self.zero_ctx
+            ctx_llm_struct_seq[out_pos] = llm_struct_value if llm_struct_value is not None else self.zero_struct_ctx
+            ctx_llm_struct_feature_seq[out_pos] = (
+                llm_struct_feature_value if llm_struct_feature_value is not None else self.zero_struct_feature_ctx
+            )
+
+        return (
+            q_seq,
+            r_seq,
+            eval_mask,
+            ctx_main_seq,
+            ctx_tpl_seq,
+            ctx_llm_seq,
+            ctx_llm_struct_seq,
+            ctx_llm_struct_feature_seq,
+        )
+
     def preprocess(self):
         problem_records = load_problem_records(self.problem_json)
         student_sequences = load_student_sequences(self.student_json)
@@ -354,9 +527,9 @@ class MOOCRadarStrict(Dataset):
         ctx_llm_struct_seqs: List[np.ndarray] = []
         ctx_llm_struct_feature_seqs: List[np.ndarray] = []
         seq_user_ids: List[str] = []
-        zero_ctx = np.zeros((context_map.context_dim,), dtype=np.float32)
-        zero_struct_ctx = np.zeros((context_map.llm_struct_dim,), dtype=np.float32)
-        zero_struct_feature_ctx = np.zeros((context_map.llm_struct_feature_dim,), dtype=np.float32)
+        zero_ctx = np.zeros((context_map.context_dim,), dtype=self.context_storage_dtype)
+        zero_struct_ctx = np.zeros((context_map.llm_struct_dim,), dtype=self.context_storage_dtype)
+        zero_struct_feature_ctx = np.zeros((context_map.llm_struct_feature_dim,), dtype=self.context_storage_dtype)
 
         all_concepts = sorted({concept for concepts in pid2concepts.values() for concept in concepts})
         rng = np.random.default_rng(self.seed)

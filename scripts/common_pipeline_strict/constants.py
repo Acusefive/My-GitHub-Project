@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
-TEXT_EMBED_MODEL_NAME = "Qwen/Qwen3-Embedding-4B"
-TEXT_RERANK_MODEL_NAME = "Qwen/Qwen3-Reranker-4B"
+TEXT_EMBED_MODEL_NAME = os.environ.get(
+    "TEXT_EMBED_MODEL_NAME",
+    "/home/xiaoyao/code/Work4.1/qwen/Qwen3-Embedding-4B",
+)
+TEXT_RERANK_MODEL_NAME = os.environ.get(
+    "TEXT_RERANK_MODEL_NAME",
+    "/home/xiaoyao/code/Work4.1/qwen/Qwen3-Reranker-4B",
+)
 TEXT_EMBED_MAX_LENGTH = 4096
 TEXT_RERANK_MAX_LENGTH = 4096
 TEXT_EMBED_BATCH_SIZE = 32

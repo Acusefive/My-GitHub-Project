@@ -72,6 +72,11 @@ from .models import load_strict_prior_model
 from .retrieval_models import QwenEmbeddingEncoder, QwenReranker
 
 
+JSON_COLLAB_NEIGHBOR_WEIGHT = 0.35
+COLLAB_ISOLATED_GATE_WEIGHT = 0.35
+COLLAB_PEER_GATE_THRESHOLD = 0.65
+
+
 @dataclass
 class Stage34Result:
     contexts_path: str
@@ -211,6 +216,7 @@ def _build_sequence_cache(
     pid_lookup: Sequence[str],
     eqsem_norm: np.ndarray,
     collab_norm: Dict[int, np.ndarray],
+    collab_neighbors: Dict[str, List[str]],
     graph_accessor: GraphAccessor,
     problem_catalog: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -238,6 +244,22 @@ def _build_sequence_cache(
         collab_pairwise = np.clip(collab_matrix @ collab_matrix.T, -1.0, 1.0).astype(np.float32)
         for left_pos, row_pos in enumerate(available_rows):
             collab_cos[row_pos, available_rows] = collab_pairwise[left_pos]
+    for target_pos, target_pid in enumerate(seq_pids):
+        ranked_neighbors = collab_neighbors.get(target_pid, []) or []
+        if not ranked_neighbors:
+            continue
+        denom = float(max(len(ranked_neighbors), 1))
+        neighbor_scores = {
+            str(pid): JSON_COLLAB_NEIGHBOR_WEIGHT * max(0.0, 1.0 - (float(rank) / denom))
+            for rank, pid in enumerate(ranked_neighbors)
+        }
+        for hist_pos in range(target_pos):
+            hist_pid = seq_pids[hist_pos]
+            if hist_pid in neighbor_scores:
+                collab_cos[hist_pos, target_pos] = max(
+                    float(collab_cos[hist_pos, target_pos]),
+                    float(neighbor_scores[hist_pid]),
+                )
 
     jaccard = np.zeros((len(seq_indices), len(seq_indices)), dtype=np.float32)
     graph_bonus = np.zeros((len(seq_indices), len(seq_indices)), dtype=np.float32)
@@ -396,6 +418,8 @@ def _candidate_scores(
     )
     collab_sim = float(seq_cache["collab_cos"][hist_pos, current_t])
     scollab = (1.0 - explicit_match) * collab_sim
+    if ki <= 0.0 and gcomp <= 0.0 and speer < COLLAB_PEER_GATE_THRESHOLD:
+        scollab *= COLLAB_ISOLATED_GATE_WEIGHT
 
     ti = math.exp(-ALPHA_TIME * dtc_value)
 
@@ -1327,6 +1351,12 @@ def run_stage34(
             eqsem_map = pickle.load(f)
         with (priors_dir / "item_collaborative_embeddings.pkl").open("rb") as f:
             collab_map = pickle.load(f)
+        collab_neighbors_path = priors_dir / "item_collaborative.json"
+        collab_neighbors = (
+            json.loads(collab_neighbors_path.read_text(encoding="utf-8"))
+            if collab_neighbors_path.exists()
+            else {}
+        )
         graph_bundle = json.loads((priors_dir / "concept_graph_bundle.json").read_text(encoding="utf-8"))
         graph_accessor = GraphAccessor(graph_bundle)
         model = load_strict_prior_model(str(priors_dir / "model_state.pt"), map_location=device).to(device)
@@ -1364,6 +1394,7 @@ def run_stage34(
                     pid_lookup,
                     eqsem_norm,
                     collab_norm,
+                    collab_neighbors,
                     graph_accessor,
                     problem_catalog_records,
                 )
@@ -1385,7 +1416,8 @@ def run_stage34(
                     dtc_values = _dtc_values(seq_problem_indices, target_t, seq_cache["eq_cos"])
 
                     candidates: List[Dict[str, Any]] = []
-                    for hist_pos in range(0, target_t):
+                    history_start = max(0, target_t - HISTORY_WINDOW)
+                    for hist_pos in range(history_start, target_t):
                         candidate = _candidate_scores(
                             hist_pos=hist_pos,
                             current_t=target_t,

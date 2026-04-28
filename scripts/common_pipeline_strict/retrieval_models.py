@@ -17,6 +17,8 @@ def _resolve_model_source(model_name_or_path: str) -> tuple[str, bool]:
     path = Path(source)
     if path.exists():
         return str(path), True
+    if path.is_absolute() or source.startswith(("/", "\\")):
+        raise FileNotFoundError(f"Local model path does not exist: {source}")
     return source, False
 
 

@@ -24,6 +24,7 @@ def main() -> None:
     print("[OK] validation finished")
     print("[REPORT]", result.report_path)
     print("[SEMANTIC_STABLE]", result.semantic_ids_stable)
+    print("[SEMANTIC_QUALITY_OK]", result.semantic_id_quality_ok)
     print("[CONTEXTS_CHECKED]", result.context_records_checked)
     print("[FAILURES]", len(result.failures))
     for failure in result.failures:
@@ -32,4 +33,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

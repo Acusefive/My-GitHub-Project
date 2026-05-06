@@ -5,6 +5,7 @@ import gc
 import json
 import math
 import os
+from functools import partial
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -389,6 +390,7 @@ def main() -> None:
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--eval_batch_size", type=int, default=None)
     parser.add_argument("--num_epochs", type=int, default=None)
     args = parser.parse_args()
 
@@ -443,6 +445,7 @@ def main() -> None:
         amp_enabled = bool(args.amp and device == "cuda")
         effective_num_workers = int(args.num_workers) if args.num_workers is not None else (0 if args.context_type == "llm" else 4)
         effective_batch_size = int(train_config["batch_size"])
+        effective_eval_batch_size = int(args.eval_batch_size) if args.eval_batch_size is not None else effective_batch_size
         if args.model_name in ("sakt", "saint"):
             model_config["n"] = seq_len
         ckpt_dir = Path(args.ckpt_root).resolve() / args.split_mode / args.model_name / args.context_type / args.fusion_type
@@ -454,9 +457,9 @@ def main() -> None:
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
         eval_loader = DataLoader(
             dataset,
-            batch_size=effective_batch_size,
+            batch_size=effective_eval_batch_size,
             shuffle=False,
-            collate_fn=collate_fn_with_context,
+            collate_fn=partial(collate_fn_with_context, context_type=args.context_type),
             num_workers=max(0, effective_num_workers),
             pin_memory=(device == "cuda"),
             persistent_workers=(effective_num_workers > 0),
@@ -474,6 +477,7 @@ def main() -> None:
                     "device": device,
                     "cpu_threads": args.cpu_threads,
                     "context_storage_dtype": args.context_storage_dtype,
+                    "eval_batch_size": int(effective_eval_batch_size),
                     "amp": amp_enabled,
                     "test_len": len(dataset),
                     "split_stats": {
@@ -522,10 +526,11 @@ def main() -> None:
     amp_enabled = bool(args.amp and device == "cuda")
     effective_num_workers = int(args.num_workers) if args.num_workers is not None else (0 if args.context_type == "llm" else 4)
     effective_batch_size = int(train_config["batch_size"])
+    effective_eval_batch_size = int(args.eval_batch_size) if args.eval_batch_size is not None else effective_batch_size
     print(
         f"[train_context] model={args.model_name} context_type={args.context_type} "
         f"split_mode={args.split_mode} "
-        f"batch_size={effective_batch_size} num_workers={effective_num_workers} "
+        f"batch_size={effective_batch_size} eval_batch_size={effective_eval_batch_size} num_workers={effective_num_workers} "
         f"cpu_threads={args.cpu_threads} context_storage_dtype={args.context_storage_dtype} "
         f"patience={args.patience} eval_interval={args.eval_interval} amp={amp_enabled} "
         f"context_dim={dataset.context_dim} llm_struct_dim={getattr(dataset, 'llm_struct_dim', 0)} "
@@ -551,16 +556,16 @@ def main() -> None:
         train_dataset,
         batch_size=effective_batch_size,
         shuffle=True,
-        collate_fn=collate_fn_with_context,
+        collate_fn=partial(collate_fn_with_context, context_type=args.context_type),
         num_workers=max(0, effective_num_workers),
         pin_memory=(device == "cuda"),
         persistent_workers=(effective_num_workers > 0),
     )
     valid_loader = DataLoader(
         valid_dataset,
-        batch_size=effective_batch_size,
+        batch_size=effective_eval_batch_size,
         shuffle=False,
-        collate_fn=collate_fn_with_context,
+        collate_fn=partial(collate_fn_with_context, context_type=args.context_type),
         num_workers=max(0, effective_num_workers),
         pin_memory=(device == "cuda"),
         persistent_workers=(effective_num_workers > 0),
@@ -621,9 +626,9 @@ def main() -> None:
     split_stats["test_dataset_stats"] = getattr(final_test_dataset, "split_stats", {})
     test_loader = DataLoader(
         final_test_dataset,
-        batch_size=effective_batch_size,
+        batch_size=effective_eval_batch_size,
         shuffle=False,
-        collate_fn=collate_fn_with_context,
+        collate_fn=partial(collate_fn_with_context, context_type=args.context_type),
         num_workers=max(0, effective_num_workers),
         pin_memory=(device == "cuda"),
         persistent_workers=(effective_num_workers > 0),
@@ -642,6 +647,7 @@ def main() -> None:
                 "context_storage_dtype": args.context_storage_dtype,
                 "patience": int(args.patience),
                 "eval_interval": int(args.eval_interval),
+                "eval_batch_size": int(effective_eval_batch_size),
                 "amp": amp_enabled,
                 "train_valid_dataset_len": train_valid_dataset_len,
                 "train_len": train_len,

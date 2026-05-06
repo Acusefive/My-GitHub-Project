@@ -83,36 +83,71 @@ def parse_llm_summary_json(text: str) -> Dict[str, Any]:
     if not raw:
         raise ValueError("llm_summary_text is empty")
     parsed = json.loads(raw)
-    expected_keys = {"stable_points", "weak_points", "volatility", "confidence", "summary"}
+    expected_keys = {
+        "mastered_concepts",
+        "weak_concepts",
+        "transfer_state",
+        "risk_level",
+        "evidence_quality",
+        "diagnosis",
+    }
     if set(parsed.keys()) != expected_keys:
         raise ValueError(f"Unexpected llm summary fields: {sorted(parsed.keys())}")
 
-    stable_raw = parsed.get("stable_points")
-    weak_raw = parsed.get("weak_points")
-    if not isinstance(stable_raw, list) or not isinstance(weak_raw, list):
-        raise ValueError("stable_points/weak_points must be arrays")
+    def _concept_items(name: str) -> List[Dict[str, Any]]:
+        raw_items = parsed.get(name)
+        if not isinstance(raw_items, list):
+            raise ValueError(f"{name} must be an array")
+        items: List[Dict[str, Any]] = []
+        for item in raw_items[:3]:
+            if not isinstance(item, dict):
+                raise ValueError(f"{name} items must be objects")
+            concept = str(item.get("concept") or "").strip()
+            evidence_ids_raw = item.get("evidence_ids") or []
+            confidence = str(item.get("confidence") or "").strip()
+            if not concept:
+                continue
+            if not isinstance(evidence_ids_raw, list):
+                raise ValueError(f"{name}.evidence_ids must be an array")
+            evidence_ids: List[int] = []
+            for evidence_id in evidence_ids_raw[:6]:
+                try:
+                    evidence_ids.append(int(evidence_id))
+                except Exception:
+                    continue
+            if confidence not in _LEVEL_VALUES:
+                raise ValueError(f"Invalid {name}.confidence: {confidence}")
+            items.append(
+                {
+                    "concept": concept,
+                    "evidence_ids": evidence_ids,
+                    "confidence": confidence,
+                }
+            )
+        return items
 
-    stable_points = [str(item).strip() for item in stable_raw if str(item).strip()]
-    weak_points = [str(item).strip() for item in weak_raw if str(item).strip()]
-    if len(stable_points) > 2 or len(weak_points) > 2:
-        raise ValueError("stable_points/weak_points exceed max length 2")
-
-    volatility = str(parsed.get("volatility")).strip()
-    confidence = str(parsed.get("confidence")).strip()
-    summary = str(parsed.get("summary")).strip()
-    if volatility not in _LEVEL_VALUES:
-        raise ValueError(f"Invalid volatility: {volatility}")
-    if confidence not in _LEVEL_VALUES:
-        raise ValueError(f"Invalid confidence: {confidence}")
-    if not summary:
-        raise ValueError("summary is empty")
+    mastered_concepts = _concept_items("mastered_concepts")
+    weak_concepts = _concept_items("weak_concepts")
+    transfer_state = str(parsed.get("transfer_state") or "").strip()
+    risk_level = str(parsed.get("risk_level") or "").strip()
+    evidence_quality = str(parsed.get("evidence_quality") or "").strip()
+    diagnosis = str(parsed.get("diagnosis") or "").strip()
+    if risk_level not in _LEVEL_VALUES:
+        raise ValueError(f"Invalid risk_level: {risk_level}")
+    if evidence_quality not in _LEVEL_VALUES:
+        raise ValueError(f"Invalid evidence_quality: {evidence_quality}")
+    if not transfer_state:
+        raise ValueError("transfer_state is empty")
+    if not diagnosis:
+        raise ValueError("diagnosis is empty")
 
     return {
-        "stable_points": stable_points,
-        "weak_points": weak_points,
-        "volatility": volatility,
-        "confidence": confidence,
-        "summary": summary,
+        "mastered_concepts": mastered_concepts,
+        "weak_concepts": weak_concepts,
+        "transfer_state": transfer_state,
+        "risk_level": risk_level,
+        "evidence_quality": evidence_quality,
+        "diagnosis": diagnosis,
     }
 
 
@@ -342,6 +377,117 @@ class OpenAICompatibleSummarizer(OpenAICompatibleJsonClient):
 
         raise ValueError(
             f"Invalid LLM summary for target_pid={target_pid}, target_semantic_id={target_semantic_id}: {last_exc}. "
+            f"raw_obj={last_raw_json}"
+        ) from last_exc
+
+
+class OpenAICompatibleSummarizer(OpenAICompatibleJsonClient):
+    def summarize(
+        self,
+        *,
+        target_pid: str,
+        target_question_text: str,
+        target_semantic_id: str,
+        target_concepts: Iterable[str],
+        evidence_list: Iterable[Dict[str, object]],
+        template_summary_text: str,
+    ) -> str:
+        evidence_lines: List[str] = []
+        for idx, evidence in enumerate(evidence_list, start=1):
+            raw_scores = evidence.get("raw_scores", {})
+            activation = evidence.get("activation", {})
+            evidence_lines.append(
+                (
+                    f"{idx}. evidence_id={idx}; "
+                    f"hist_pid={evidence.get('problem_id', '')}; "
+                    f"hist_semantic_id={evidence.get('semantic_id', '')}; "
+                    f"history_pos={evidence.get('history_pos', '')}; "
+                    f"role={evidence.get('role', '')}; "
+                    f"overlap={evidence.get('knowledge_overlap', '')}; "
+                    f"level_diff={evidence.get('level_diff', '')}; "
+                    f"answer={evidence.get('answer_result', '')}; "
+                    f"support_score={evidence.get('support_score', '')}; "
+                    f"activation={json.dumps(activation, ensure_ascii=False)}; "
+                    f"raw_scores={json.dumps(raw_scores, ensure_ascii=False)}; "
+                    f"text={evidence.get('question_text', '')}"
+                )
+            )
+
+        prompt = (
+            "你是一个教育认知诊断压缩器。\n\n"
+            "任务：根据目标题、学生近期模板统计摘要、以及已筛选的认知证据，生成结构化诊断 JSON。\n\n"
+            "严格要求：\n"
+            "1. 只能输出一个 JSON 对象，不要输出 Markdown、解释或 <think>。\n"
+            "2. JSON 必须且只能包含 mastered_concepts, weak_concepts, transfer_state, risk_level, evidence_quality, diagnosis 这 6 个字段。\n"
+            "3. mastered_concepts 和 weak_concepts 必须是数组，最多各 3 项；没有内容时输出 []。\n"
+            "4. mastered_concepts/weak_concepts 的每一项必须是对象：{\"concept\":字符串,\"evidence_ids\":整数数组,\"confidence\":\"低/中/高\"}。\n"
+            "5. concept 只能来自目标题知识点或证据 overlap，不得编造输入中不存在的知识点。\n"
+            "6. evidence_ids 必须引用输入证据里的 evidence_id；若证据不足可为空数组。\n"
+            "7. risk_level 和 evidence_quality 只能取 低、中、高。\n"
+            "8. transfer_state 用一个短语概括迁移状态，例如：同质迁移稳定、前置不足、高阶迁移风险、协同证据不足、证据有限。\n"
+            "9. diagnosis 必须是 1 到 2 句中文，总长度不超过 80 字，且不能为空。\n"
+            "10. 如果证据冲突、主要依赖协同、或知识重合弱，应降低 evidence_quality 或 confidence。\n\n"
+            "合法输出示例：\n"
+            '{"mastered_concepts":[{"concept":"放大电路","evidence_ids":[1,3],"confidence":"高"}],"weak_concepts":[{"concept":"输出电阻","evidence_ids":[2],"confidence":"中"}],"transfer_state":"同质迁移稳定","risk_level":"中","evidence_quality":"高","diagnosis":"放大电路相关证据较稳定，但输出电阻迁移仍有风险。"}\n\n'
+            f"目标题ID: {target_pid}\n"
+            f"目标题语义ID: {target_semantic_id}\n"
+            f"目标题文本: {target_question_text}\n"
+            f"目标题知识点: {'、'.join(str(x) for x in target_concepts)}\n"
+            f"学生近期模板统计摘要: {template_summary_text}\n\n"
+            "认知证据:\n"
+            + "\n".join(evidence_lines)
+        )
+        system_prompt = (
+            "你只输出一个合法 JSON 对象。"
+            "必须同时包含 mastered_concepts、weak_concepts、transfer_state、risk_level、evidence_quality、diagnosis 这 6 个字段。"
+            "不得输出 <think>、解释、分析过程、Markdown 代码块或额外文本。"
+        )
+
+        current_user_prompt = prompt
+        last_exc: Optional[Exception] = None
+        last_raw_json = ""
+        for attempt in range(3):
+            obj = self.request_json(system_prompt=system_prompt, user_prompt=current_user_prompt)
+            raw_json = json.dumps(obj, ensure_ascii=False)
+            last_raw_json = raw_json
+            try:
+                parsed = parse_llm_summary_json(raw_json)
+                return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= 2:
+                    break
+                current_user_prompt = (
+                    "你上一次输出的 JSON 不合法，请严格修复。\n"
+                    "必须只包含 mastered_concepts, weak_concepts, transfer_state, risk_level, evidence_quality, diagnosis 这 6 个字段；"
+                    "mastered_concepts 和 weak_concepts 必须是数组；risk_level/evidence_quality 只能是 低、中、高；diagnosis 不能为空。\n\n"
+                    f"原始非法 JSON:\n{raw_json}\n\n"
+                    f"错误原因: {exc}"
+                )
+
+        hard_schema_prompt = (
+            "请直接填写下面这个 JSON 模板，不得增加或删除字段：\n"
+            "{\"mastered_concepts\":[],\"weak_concepts\":[],\"transfer_state\":\"证据有限\",\"risk_level\":\"中\",\"evidence_quality\":\"低\",\"diagnosis\":\"当前证据有限，稳定掌握点与薄弱点暂不明显。\"}\n\n"
+            "只能依据输入证据填写；concept 只能来自目标题知识点或 overlap；evidence_ids 必须引用证据编号。\n\n"
+            f"目标题ID: {target_pid}\n"
+            f"目标题语义ID: {target_semantic_id}\n"
+            f"目标题文本: {target_question_text}\n"
+            f"目标题知识点: {'、'.join(str(x) for x in target_concepts)}\n"
+            f"学生近期模板统计摘要: {template_summary_text}\n"
+            "认知证据:\n"
+            + "\n".join(evidence_lines)
+        )
+        try:
+            obj = self.request_json(system_prompt=system_prompt, user_prompt=hard_schema_prompt)
+            raw_json = json.dumps(obj, ensure_ascii=False)
+            last_raw_json = raw_json
+            parsed = parse_llm_summary_json(raw_json)
+            return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        except Exception as exc:
+            last_exc = exc
+
+        raise ValueError(
+            f"Invalid LLM diagnosis for target_pid={target_pid}, target_semantic_id={target_semantic_id}: {last_exc}. "
             f"raw_obj={last_raw_json}"
         ) from last_exc
 

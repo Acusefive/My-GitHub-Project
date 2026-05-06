@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
 import math
 import pickle
@@ -667,6 +668,70 @@ def _build_llm_struct_feature_vector(record: Dict[str, Any]) -> np.ndarray:
     return features
 
 
+def _build_llm_context_text(llm_summary_text: str, main_context_text: str) -> str:
+    parsed = parse_llm_summary_json(str(llm_summary_text or ""))
+    parts: List[str] = []
+    diagnosis = str(parsed.get("diagnosis") or "").strip()
+    if diagnosis:
+        parts.append(diagnosis)
+    mastered = [str(item.get("concept") or "").strip() for item in parsed.get("mastered_concepts", []) if str(item.get("concept") or "").strip()]
+    weak = [str(item.get("concept") or "").strip() for item in parsed.get("weak_concepts", []) if str(item.get("concept") or "").strip()]
+    if mastered:
+        parts.append("稳定掌握点：" + "、".join(mastered))
+    if weak:
+        parts.append("持续薄弱点：" + "、".join(weak))
+    parts.append(f"迁移状态：{parsed['transfer_state']}")
+    parts.append(f"风险等级：{parsed['risk_level']}")
+    parts.append(f"证据质量：{parsed['evidence_quality']}")
+    summary = " ".join(part.strip() for part in parts if part.strip())
+    main = str(main_context_text or "").strip()
+    if summary and main:
+        return summary + "\n" + main
+    return summary or main
+
+
+def _build_llm_struct_texts(record: Dict[str, Any]) -> Dict[str, str]:
+    llm_summary_text = str(record.get("summary_fields", {}).get("llm_summary_text") or "").strip()
+    parsed = parse_llm_summary_json(llm_summary_text)
+    stable_text = "、".join(str(item.get("concept") or "").strip() for item in parsed["mastered_concepts"] if str(item.get("concept") or "").strip())
+    weak_text = "、".join(str(item.get("concept") or "").strip() for item in parsed["weak_concepts"] if str(item.get("concept") or "").strip())
+    summary_text = str(parsed["diagnosis"])
+    aux_text = (
+        f"迁移状态 {parsed['transfer_state']} "
+        f"风险等级 {parsed['risk_level']} "
+        f"证据质量 {parsed['evidence_quality']}"
+    )
+    return {
+        "stable_text": stable_text,
+        "weak_text": weak_text,
+        "summary_text": summary_text,
+        "aux_text": aux_text,
+    }
+
+
+def _build_llm_struct_feature_vector(record: Dict[str, Any]) -> np.ndarray:
+    llm_summary_text = str(record.get("summary_fields", {}).get("llm_summary_text") or "").strip()
+    parsed = parse_llm_summary_json(llm_summary_text)
+    mastered_points = [str(item.get("concept") or "").strip() for item in parsed["mastered_concepts"] if str(item.get("concept") or "").strip()]
+    weak_points = [str(item.get("concept") or "").strip() for item in parsed["weak_concepts"] if str(item.get("concept") or "").strip()]
+    diagnosis = str(parsed["diagnosis"]).strip()
+    levels = ("低", "中", "高")
+    risk_onehot = [1.0 if parsed["risk_level"] == level else 0.0 for level in levels]
+    quality_onehot = [1.0 if parsed["evidence_quality"] == level else 0.0 for level in levels]
+    return np.asarray(
+        [
+            float(len(mastered_points)) / 3.0,
+            float(len(weak_points)) / 3.0,
+            1.0 if mastered_points else 0.0,
+            1.0 if weak_points else 0.0,
+            min(float(len(diagnosis)), 80.0) / 80.0,
+            *risk_onehot,
+            *quality_onehot,
+        ],
+        dtype=np.float32,
+    )
+
+
 def _unique_texts_with_inverse(texts: Sequence[str]) -> Tuple[List[str], np.ndarray]:
     unique_texts: List[str] = []
     inverse_indices = np.zeros((len(texts),), dtype=np.int64)
@@ -926,6 +991,35 @@ def _enrich_contexts_with_llm_summary(
     llm_summary_workers: int,
     llm_summary_chunk_size: int,
 ) -> None:
+    ensure_dir(cache_dir)
+
+    def _summary_signature_key(record: Dict[str, Any]) -> str:
+        """Semantic cache key for LLM summaries across repeated context shapes."""
+        summary_fields = record.get("summary_fields") or {}
+        evidence_signature: List[Dict[str, Any]] = []
+        for evidence in record.get("evidence_list") or []:
+            evidence_signature.append(
+                {
+                    "semantic_id": str(evidence.get("semantic_id") or ""),
+                    "role": str(evidence.get("role") or ""),
+                    "knowledge_overlap": str(evidence.get("knowledge_overlap") or ""),
+                    "level_diff": int(evidence.get("level_diff") or 0),
+                    "answer_result": str(evidence.get("answer_result") or ""),
+                    "support_band": round(float(evidence.get("support_score") or 0.0), 1),
+                }
+            )
+        payload = {
+            "target_semantic_id": str(record.get("target_semantic_id") or ""),
+            "target_concepts": [str(item) for item in summary_fields.get("target_concepts") or []],
+            "dominant_role": str(summary_fields.get("dominant_role") or ""),
+            "risk_level": str(summary_fields.get("risk_level") or ""),
+            "recent_trend": str(summary_fields.get("recent_trend") or ""),
+            "evidence": evidence_signature,
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+        return f"semantic-signature\t{digest}"
+
     def _summarize_record(record: Dict[str, Any]) -> str:
         target_pid = str(record["target_pid"])
         target_meta = problem_catalog_records[target_pid]
@@ -978,28 +1072,49 @@ def _enrich_contexts_with_llm_summary(
         new_cache_entries: List[Tuple[str, str]] = []
         for idx, record in enumerate(chunk_records):
             key = summary_cache_key(record["user_id"], int(record["target_t"]), record["target_pid"])
-            llm_summary_text = llm_cache.get(key, "").strip()
+            signature_key = _summary_signature_key(record)
+            llm_summary_text = (llm_cache.get(key, "") or llm_cache.get(signature_key, "")).strip()
             record["_llm_key"] = key
+            record["_llm_signature_key"] = signature_key
             if llm_summary_text:
                 record["_llm_summary_text"] = llm_summary_text
+                if key not in llm_cache:
+                    llm_cache[key] = llm_summary_text
+                    new_cache_entries.append((key, llm_summary_text))
+                if signature_key and signature_key not in llm_cache:
+                    llm_cache[signature_key] = llm_summary_text
+                    new_cache_entries.append((signature_key, llm_summary_text))
             else:
                 missing_items.append((idx, key, record))
 
         if missing_items:
+            signature_owner: Dict[str, Tuple[int, str, Dict[str, Any]]] = {}
+            duplicate_items: List[Tuple[int, str, str, Dict[str, Any]]] = []
+            for idx, key, record in missing_items:
+                signature_key = str(record.get("_llm_signature_key") or "")
+                if signature_key in signature_owner:
+                    duplicate_items.append((idx, key, signature_key, record))
+                else:
+                    signature_owner[signature_key] = (idx, key, record)
+            unique_missing_items = list(signature_owner.values())
             if executor is None or len(missing_items) == 1:
-                for idx, key, record in missing_items:
+                for idx, key, record in unique_missing_items:
                     try:
                         llm_summary_text = _summarize_record(record)
                     except Exception as exc:
                         _record_failure(record, key=key, exc=exc)
                         continue
+                    signature_key = str(record.get("_llm_signature_key") or "")
                     record["_llm_summary_text"] = llm_summary_text
                     llm_cache[key] = llm_summary_text
                     new_cache_entries.append((key, llm_summary_text))
+                    if signature_key and signature_key not in llm_cache:
+                        llm_cache[signature_key] = llm_summary_text
+                        new_cache_entries.append((signature_key, llm_summary_text))
             else:
                 future_map = {
                     executor.submit(_summarize_record, record): (idx, key, record)
-                    for idx, key, record in missing_items
+                    for idx, key, record in unique_missing_items
                 }
                 for future in as_completed(future_map):
                     idx, key, record = future_map[future]
@@ -1008,15 +1123,28 @@ def _enrich_contexts_with_llm_summary(
                     except Exception as exc:
                         _record_failure(record, key=key, exc=exc)
                         continue
+                    signature_key = str(record.get("_llm_signature_key") or "")
                     record["_llm_summary_text"] = llm_summary_text
                     llm_cache[key] = llm_summary_text
                     new_cache_entries.append((key, llm_summary_text))
+                    if signature_key and signature_key not in llm_cache:
+                        llm_cache[signature_key] = llm_summary_text
+                        new_cache_entries.append((signature_key, llm_summary_text))
+
+            for _idx, key, signature_key, record in duplicate_items:
+                llm_summary_text = str(llm_cache.get(signature_key, "") or "").strip()
+                if not llm_summary_text:
+                    continue
+                record["_llm_summary_text"] = llm_summary_text
+                llm_cache[key] = llm_summary_text
+                new_cache_entries.append((key, llm_summary_text))
 
         if new_cache_entries:
             append_summary_cache_entries(llm_cache_path, new_cache_entries)
 
         for record in chunk_records:
             key = str(record.pop("_llm_key"))
+            record.pop("_llm_signature_key", None)
             llm_summary_text = str(record.pop("_llm_summary_text", "") or "")
             if not llm_summary_text:
                 dst.write(json.dumps(record, ensure_ascii=False) + "\n")

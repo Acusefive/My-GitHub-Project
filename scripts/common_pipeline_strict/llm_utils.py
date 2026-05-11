@@ -176,6 +176,9 @@ class OpenAICompatibleJsonClient:
         self.retries = int(retries)
 
     def request_json(self, *, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
+        return self.request_json_with_raw(system_prompt=system_prompt, user_prompt=user_prompt)["parsed"]
+
+    def request_json_with_raw(self, *, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
         body = {
             "model": self.model,
             "messages": [
@@ -204,10 +207,17 @@ class OpenAICompatibleJsonClient:
                     raw = resp.read().decode("utf-8")
                 data = json.loads(raw)
                 content = data["choices"][0]["message"]["content"]
-                text = self._postprocess_content(self._flatten_content(content))
+                content_text = self._flatten_content(content)
+                text = self._postprocess_content(content_text)
                 if not text:
                     raise ValueError("Empty JSON response returned from LLM")
-                return json.loads(text)
+                return {
+                    "parsed": json.loads(text),
+                    "raw_response": raw,
+                    "content": content_text,
+                    "json_text": text,
+                    "attempts": attempt,
+                }
             except (error.URLError, error.HTTPError, json.JSONDecodeError, KeyError, ValueError) as exc:
                 last_error = exc
                 if attempt >= self.retries:

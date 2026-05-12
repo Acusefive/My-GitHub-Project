@@ -42,10 +42,15 @@ def reset_context_fusion_stats(model) -> None:
 
 
 def get_context_fusion_stats(model) -> Dict[str, float]:
+    stats: Dict[str, float] = {}
     fusion = getattr(model, "context_fusion", None)
     if fusion is not None and hasattr(fusion, "get_usage_stats"):
-        return dict(fusion.get_usage_stats())
-    return {}
+        stats.update(dict(fusion.get_usage_stats()))
+    context_logit_head = getattr(model, "context_logit_head", None)
+    context_logit_scale = getattr(context_logit_head, "scale", None)
+    if context_logit_scale is not None:
+        stats["context_logit_scale"] = float(context_logit_scale.detach().cpu().item())
+    return stats
 
 
 def select_context(
@@ -73,15 +78,31 @@ def select_context(
     raise ValueError(f"Unsupported context_type: {context_type}")
 
 
-def build_model(model_name: str, dataset: MOOCRadarStrict, model_config: Dict[str, object], fusion_type: str, context_type: str):
+def build_model(
+    model_name: str,
+    dataset: MOOCRadarStrict,
+    model_config: Dict[str, object],
+    fusion_type: str,
+    context_type: str,
+    *,
+    ctx_encoder_dim: int = 256,
+    ctx_logit_hidden_dim: int = 128,
+):
     config = dict(model_config)
     ctx_dim = dataset.context_dim
+    ctx_group_dims = None
     if context_type == "llm":
+        llm_struct_dim = int(getattr(dataset, "llm_struct_dim", 0))
+        llm_struct_feature_dim = int(getattr(dataset, "llm_struct_feature_dim", 0))
         ctx_dim = int(
             dataset.context_dim
-            + getattr(dataset, "llm_struct_dim", 0)
-            + getattr(dataset, "llm_struct_feature_dim", 0)
+            + llm_struct_dim
+            + llm_struct_feature_dim
         )
+        ctx_group_dims = (int(dataset.context_dim), llm_struct_dim, llm_struct_feature_dim)
+    config["ctx_encoder_dim"] = int(ctx_encoder_dim)
+    config["ctx_group_dims"] = ctx_group_dims
+    config["ctx_logit_hidden_dim"] = int(ctx_logit_hidden_dim)
     if model_name == "dkt":
         return DKTContext(dataset.num_q, ctx_dim=ctx_dim, fusion_type=fusion_type, **config)
     if model_name == "sakt":
@@ -148,6 +169,15 @@ def split_dataset(dataset, train_ratio: float, seed: int, split_dir: Path) -> Tu
         "test_user_count": len(test_users),
     }
     return Subset(dataset, train_indices), Subset(dataset, test_indices), split_stats
+
+
+def limit_dataset(dataset, limit: int, seed: int):
+    limit = int(limit or 0)
+    if limit <= 0 or limit >= len(dataset):
+        return dataset
+    rng = np.random.default_rng(int(seed))
+    indices = rng.choice(len(dataset), size=limit, replace=False)
+    return Subset(dataset, np.sort(indices).astype(np.int64).tolist())
 
 
 def evaluate(model, loader, device: str, model_name: str, context_type: str, amp_enabled: bool = False) -> Dict[str, float]:
@@ -287,7 +317,7 @@ def train(
         train_gate_summary = ""
         eval_gate_summary = ""
         if context_type != "none":
-            if train_context_fusion.get("fusion_mode") == "gate" and int(train_context_fusion.get("usage_steps", 0)) > 0:
+            if train_context_fusion.get("fusion_mode") in {"gate", "residual_gate"} and int(train_context_fusion.get("usage_steps", 0)) > 0:
                 train_gate_summary = (
                     ", Train Gate Mean: {gate_mean:.4f}, Train Ctx Weight: {ctx_weight_mean:.4f}, "
                     "Train Gate<0.1: {gate_low:.4f}, Train Gate>0.9: {gate_high:.4f}"
@@ -298,7 +328,7 @@ def train(
                     gate_high=float(train_context_fusion["gate_gt_0_9_frac"]),
                 )
             eval_context_fusion = eval_metrics.get("context_fusion") or {}
-            if eval_context_fusion.get("fusion_mode") == "gate" and int(eval_context_fusion.get("usage_steps", 0)) > 0:
+            if eval_context_fusion.get("fusion_mode") in {"gate", "residual_gate"} and int(eval_context_fusion.get("usage_steps", 0)) > 0:
                 eval_gate_summary = (
                     ", Eval Gate Mean: {gate_mean:.4f}, Eval Ctx Weight: {ctx_weight_mean:.4f}, "
                     "Eval Gate<0.1: {gate_low:.4f}, Eval Gate>0.9: {gate_high:.4f}"
@@ -358,7 +388,7 @@ def main() -> None:
     workspace = Path(__file__).resolve().parent
     parser.add_argument("--model_name", type=str, default="dkt", choices=["dkt", "sakt", "saint"])
     parser.add_argument("--context_type", type=str, default="llm", choices=["none", "main", "template", "llm"])
-    parser.add_argument("--fusion_type", type=str, default="gate", choices=["add", "concat", "gate"])
+    parser.add_argument("--fusion_type", type=str, default="gate", choices=["add", "concat", "gate", "residual_gate"])
     parser.add_argument("--problem_json", type=str, default=str(workspace / "datalocal" / "problem.json"))
     parser.add_argument("--student_json", type=str, default=str(workspace / "datalocal" / "student-problem-fine.json"))
     parser.add_argument(
@@ -379,6 +409,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--split_mode", type=str, default="user", choices=["user", "new_concept"])
     parser.add_argument("--test_concept_ratio", type=float, default=0.2)
+    parser.add_argument("--valid_concept_ratio", type=float, default=0.0)
     parser.add_argument("--valid_ratio", type=float, default=0.1)
     parser.add_argument("--cache_dataset", action="store_true")
     parser.add_argument("--eval_only", action="store_true")
@@ -392,6 +423,10 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--eval_batch_size", type=int, default=None)
     parser.add_argument("--num_epochs", type=int, default=None)
+    parser.add_argument("--valid_limit", type=int, default=0)
+    parser.add_argument("--test_limit", type=int, default=0)
+    parser.add_argument("--ctx_encoder_dim", type=int, default=256)
+    parser.add_argument("--ctx_logit_hidden_dim", type=int, default=128)
     args = parser.parse_args()
 
     if args.cpu_threads is not None:
@@ -427,6 +462,7 @@ def main() -> None:
         "split_mode": args.split_mode,
         "seed": int(args.seed),
         "test_concept_ratio": float(args.test_concept_ratio),
+        "valid_concept_ratio": float(args.valid_concept_ratio),
         "cache_preprocessed": (args.split_mode == "user" or args.cache_dataset),
         "context_storage_dtype": args.context_storage_dtype,
     }
@@ -441,11 +477,15 @@ def main() -> None:
         if args.context_type == "llm" and not getattr(dataset, "has_llm_struct_feature_context", False):
             raise ValueError("Requested context_type=llm but context_embeddings.pkl does not contain llm_struct_features")
 
+        eval_split_stats = getattr(dataset, "split_stats", {})
         device = "cuda" if torch.cuda.is_available() else "cpu"
         amp_enabled = bool(args.amp and device == "cuda")
+        context_tensor_dtype = "float16" if amp_enabled and args.context_storage_dtype == "float16" else "float32"
         effective_num_workers = int(args.num_workers) if args.num_workers is not None else (0 if args.context_type == "llm" else 4)
         effective_batch_size = int(train_config["batch_size"])
         effective_eval_batch_size = int(args.eval_batch_size) if args.eval_batch_size is not None else effective_batch_size
+        full_eval_len = len(dataset)
+        dataset = limit_dataset(dataset, int(args.test_limit), int(args.seed) + 29)
         if args.model_name in ("sakt", "saint"):
             model_config["n"] = seq_len
         ckpt_dir = Path(args.ckpt_root).resolve() / args.split_mode / args.model_name / args.context_type / args.fusion_type
@@ -453,13 +493,25 @@ def main() -> None:
         if not ckpt_path.exists():
             raise FileNotFoundError(ckpt_path)
 
-        model = build_model(args.model_name, dataset, model_config, args.fusion_type, args.context_type).to(device)
+        model = build_model(
+            args.model_name,
+            dataset,
+            model_config,
+            args.fusion_type,
+            args.context_type,
+            ctx_encoder_dim=int(args.ctx_encoder_dim),
+            ctx_logit_hidden_dim=int(args.ctx_logit_hidden_dim),
+        ).to(device)
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
         eval_loader = DataLoader(
             dataset,
             batch_size=effective_eval_batch_size,
             shuffle=False,
-            collate_fn=partial(collate_fn_with_context, context_type=args.context_type),
+            collate_fn=partial(
+                collate_fn_with_context,
+                context_type=args.context_type,
+                context_tensor_dtype=context_tensor_dtype,
+            ),
             num_workers=max(0, effective_num_workers),
             pin_memory=(device == "cuda"),
             persistent_workers=(effective_num_workers > 0),
@@ -476,13 +528,19 @@ def main() -> None:
                     "eval_only": True,
                     "device": device,
                     "cpu_threads": args.cpu_threads,
+                    "valid_concept_ratio": float(args.valid_concept_ratio),
                     "context_storage_dtype": args.context_storage_dtype,
                     "eval_batch_size": int(effective_eval_batch_size),
+                    "context_tensor_dtype": context_tensor_dtype,
+                    "ctx_encoder_dim": int(args.ctx_encoder_dim),
+                    "ctx_logit_hidden_dim": int(args.ctx_logit_hidden_dim),
                     "amp": amp_enabled,
+                    "full_test_len": int(full_eval_len),
                     "test_len": len(dataset),
+                    "test_limit": int(args.test_limit),
                     "split_stats": {
                         "split_mode": args.split_mode,
-                        "test_dataset_stats": getattr(dataset, "split_stats", {}),
+                        "test_dataset_stats": eval_split_stats,
                     },
                     "context_dim": dataset.context_dim,
                     "has_llm_context": dataset.has_llm_context,
@@ -509,7 +567,18 @@ def main() -> None:
         print("[METRICS]", metrics_path)
         return
 
-    if args.split_mode == "new_concept":
+    use_concept_valid = args.split_mode == "new_concept" and float(args.valid_concept_ratio) > 0.0
+    concept_valid_dataset = None
+    if use_concept_valid:
+        dataset = MOOCRadarStrict(**dataset_kwargs, split_role="train")
+        concept_valid_dataset = MOOCRadarStrict(**dataset_kwargs, split_role="valid")
+        if len(concept_valid_dataset) == 0:
+            raise ValueError(
+                "valid_concept_ratio produced an empty cold-start validation set; "
+                "increase --valid_concept_ratio or use --valid_concept_ratio 0.0"
+            )
+        final_test_dataset = None
+    elif args.split_mode == "new_concept":
         dataset = MOOCRadarStrict(**dataset_kwargs, split_role="train_valid")
         final_test_dataset = None
     else:
@@ -524,39 +593,64 @@ def main() -> None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     amp_enabled = bool(args.amp and device == "cuda")
+    context_tensor_dtype = "float16" if amp_enabled and args.context_storage_dtype == "float16" else "float32"
     effective_num_workers = int(args.num_workers) if args.num_workers is not None else (0 if args.context_type == "llm" else 4)
     effective_batch_size = int(train_config["batch_size"])
     effective_eval_batch_size = int(args.eval_batch_size) if args.eval_batch_size is not None else effective_batch_size
     print(
         f"[train_context] model={args.model_name} context_type={args.context_type} "
         f"split_mode={args.split_mode} "
+        f"test_concept_ratio={float(args.test_concept_ratio)} valid_concept_ratio={float(args.valid_concept_ratio)} "
         f"batch_size={effective_batch_size} eval_batch_size={effective_eval_batch_size} num_workers={effective_num_workers} "
         f"cpu_threads={args.cpu_threads} context_storage_dtype={args.context_storage_dtype} "
+        f"context_tensor_dtype={context_tensor_dtype} valid_limit={int(args.valid_limit)} test_limit={int(args.test_limit)} "
+        f"ctx_encoder_dim={int(args.ctx_encoder_dim)} ctx_logit_hidden_dim={int(args.ctx_logit_hidden_dim)} "
         f"patience={args.patience} eval_interval={args.eval_interval} amp={amp_enabled} "
         f"context_dim={dataset.context_dim} llm_struct_dim={getattr(dataset, 'llm_struct_dim', 0)} "
         f"llm_struct_feature_dim={getattr(dataset, 'llm_struct_feature_dim', 0)}",
         flush=True,
     )
-    valid_tag = str(float(args.valid_ratio)).replace(".", "p")
-    split_dir = Path(args.dataset_dir).resolve() / f"splits_{args.split_mode}_seq{seq_len}_seed{int(args.seed)}_valid{valid_tag}"
-    if args.split_mode == "new_concept":
-        train_ratio = 1.0 - float(args.valid_ratio)
-    else:
-        train_ratio = float(train_config["train_ratio"])
-    train_dataset, valid_dataset, split_stats = split_dataset(dataset, train_ratio, int(args.seed), split_dir)
-    split_stats.update(
-        {
+    if use_concept_valid:
+        train_dataset = dataset
+        valid_dataset = concept_valid_dataset
+        split_stats = {
             "split_mode": args.split_mode,
-            "valid_ratio": float(args.valid_ratio),
-            "train_valid_dataset_stats": getattr(dataset, "split_stats", {}),
+            "valid_ratio": None,
+            "valid_concept_ratio": float(args.valid_concept_ratio),
+            "train_dataset_stats": getattr(dataset, "split_stats", {}),
+            "valid_dataset_stats": getattr(valid_dataset, "split_stats", {}),
         }
-    )
+    else:
+        valid_tag = str(float(args.valid_ratio)).replace(".", "p")
+        split_dir = Path(args.dataset_dir).resolve() / f"splits_{args.split_mode}_seq{seq_len}_seed{int(args.seed)}_valid{valid_tag}"
+        if args.split_mode == "new_concept":
+            train_ratio = 1.0 - float(args.valid_ratio)
+        else:
+            train_ratio = float(train_config["train_ratio"])
+        train_dataset, valid_dataset, split_stats = split_dataset(dataset, train_ratio, int(args.seed), split_dir)
+        split_stats.update(
+            {
+                "split_mode": args.split_mode,
+                "valid_ratio": float(args.valid_ratio),
+                "valid_concept_ratio": float(args.valid_concept_ratio),
+                "train_valid_dataset_stats": getattr(dataset, "split_stats", {}),
+            }
+        )
+    full_valid_len = len(valid_dataset)
+    valid_dataset = limit_dataset(valid_dataset, int(args.valid_limit), int(args.seed) + 17)
+    split_stats["full_valid_len"] = int(full_valid_len)
+    split_stats["valid_eval_len"] = int(len(valid_dataset))
+    split_stats["valid_limit"] = int(args.valid_limit)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=effective_batch_size,
         shuffle=True,
-        collate_fn=partial(collate_fn_with_context, context_type=args.context_type),
+        collate_fn=partial(
+            collate_fn_with_context,
+            context_type=args.context_type,
+            context_tensor_dtype=context_tensor_dtype,
+        ),
         num_workers=max(0, effective_num_workers),
         pin_memory=(device == "cuda"),
         persistent_workers=(effective_num_workers > 0),
@@ -565,7 +659,11 @@ def main() -> None:
         valid_dataset,
         batch_size=effective_eval_batch_size,
         shuffle=False,
-        collate_fn=partial(collate_fn_with_context, context_type=args.context_type),
+        collate_fn=partial(
+            collate_fn_with_context,
+            context_type=args.context_type,
+            context_tensor_dtype=context_tensor_dtype,
+        ),
         num_workers=max(0, effective_num_workers),
         pin_memory=(device == "cuda"),
         persistent_workers=(effective_num_workers > 0),
@@ -573,7 +671,15 @@ def main() -> None:
     if args.model_name in ("sakt", "saint"):
         model_config["n"] = seq_len
 
-    model = build_model(args.model_name, dataset, model_config, args.fusion_type, args.context_type).to(device)
+    model = build_model(
+        args.model_name,
+        dataset,
+        model_config,
+        args.fusion_type,
+        args.context_type,
+        ctx_encoder_dim=int(args.ctx_encoder_dim),
+        ctx_logit_hidden_dim=int(args.ctx_logit_hidden_dim),
+    ).to(device)
 
     optimizer_name = str(train_config["optimizer"]).lower()
     lr = float(train_config["learning_rate"])
@@ -599,7 +705,7 @@ def main() -> None:
         eval_interval=int(args.eval_interval),
         amp_enabled=amp_enabled,
     )
-    train_valid_dataset_len = len(dataset)
+    train_valid_dataset_len = len(train_dataset) + int(full_valid_len)
     train_len = len(train_dataset)
     valid_len = len(valid_dataset)
     context_info = {
@@ -624,11 +730,20 @@ def main() -> None:
     if args.split_mode == "new_concept":
         final_test_dataset = MOOCRadarStrict(**dataset_kwargs, split_role="test")
     split_stats["test_dataset_stats"] = getattr(final_test_dataset, "split_stats", {})
+    full_test_len = len(final_test_dataset)
+    final_test_dataset = limit_dataset(final_test_dataset, int(args.test_limit), int(args.seed) + 29)
+    split_stats["full_test_len"] = int(full_test_len)
+    split_stats["test_eval_len"] = int(len(final_test_dataset))
+    split_stats["test_limit"] = int(args.test_limit)
     test_loader = DataLoader(
         final_test_dataset,
         batch_size=effective_eval_batch_size,
         shuffle=False,
-        collate_fn=partial(collate_fn_with_context, context_type=args.context_type),
+        collate_fn=partial(
+            collate_fn_with_context,
+            context_type=args.context_type,
+            context_tensor_dtype=context_tensor_dtype,
+        ),
         num_workers=max(0, effective_num_workers),
         pin_memory=(device == "cuda"),
         persistent_workers=(effective_num_workers > 0),
@@ -644,15 +759,23 @@ def main() -> None:
                 "split_mode": args.split_mode,
                 "device": device,
                 "cpu_threads": args.cpu_threads,
+                "valid_concept_ratio": float(args.valid_concept_ratio),
                 "context_storage_dtype": args.context_storage_dtype,
                 "patience": int(args.patience),
                 "eval_interval": int(args.eval_interval),
                 "eval_batch_size": int(effective_eval_batch_size),
+                "context_tensor_dtype": context_tensor_dtype,
+                "ctx_encoder_dim": int(args.ctx_encoder_dim),
+                "ctx_logit_hidden_dim": int(args.ctx_logit_hidden_dim),
                 "amp": amp_enabled,
                 "train_valid_dataset_len": train_valid_dataset_len,
                 "train_len": train_len,
                 "valid_len": valid_len,
+                "full_valid_len": int(full_valid_len),
+                "valid_limit": int(args.valid_limit),
                 "test_len": len(final_test_dataset),
+                "full_test_len": int(full_test_len),
+                "test_limit": int(args.test_limit),
                 "split_stats": split_stats,
                 **context_info,
                 "fusion_type": args.fusion_type,

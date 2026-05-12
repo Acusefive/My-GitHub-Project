@@ -6,8 +6,16 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 
 
-def collate_fn_with_context(batch, pad_val: int = -1, context_type: str = "all"):
+def collate_fn_with_context(
+    batch,
+    pad_val: int = -1,
+    context_type: str = "all",
+    context_tensor_dtype: str = "float32",
+):
     context_type = str(context_type or "all")
+    if context_tensor_dtype not in {"float32", "float16"}:
+        raise ValueError(f"Unsupported context_tensor_dtype: {context_tensor_dtype}")
+    ctx_dtype = torch.float16 if context_tensor_dtype == "float16" else torch.float32
     use_main = context_type in {"all", "main"}
     use_template = context_type in {"all", "template"}
     use_llm = context_type in {"all", "llm"}
@@ -34,13 +42,13 @@ def collate_fn_with_context(batch, pad_val: int = -1, context_type: str = "all")
         rshft_seqs.append(torch.tensor(r_seq[1:], dtype=torch.long))
         eval_mask_seqs.append(torch.tensor(eval_mask_seq[1:], dtype=torch.bool))
         if use_main:
-            ctx_main_seqs.append(torch.tensor(ctx_main_seq[1:], dtype=torch.float32))
+            ctx_main_seqs.append(torch.as_tensor(ctx_main_seq[1:], dtype=ctx_dtype))
         if use_template:
-            ctx_tpl_seqs.append(torch.tensor(ctx_tpl_seq[1:], dtype=torch.float32))
+            ctx_tpl_seqs.append(torch.as_tensor(ctx_tpl_seq[1:], dtype=ctx_dtype))
         if use_llm:
-            ctx_llm_seqs.append(torch.tensor(ctx_llm_seq[1:], dtype=torch.float32))
-            ctx_llm_struct_seqs.append(torch.tensor(ctx_llm_struct_seq[1:], dtype=torch.float32))
-            ctx_llm_struct_feature_seqs.append(torch.tensor(ctx_llm_struct_feature_seq[1:], dtype=torch.float32))
+            ctx_llm_seqs.append(torch.as_tensor(ctx_llm_seq[1:], dtype=ctx_dtype))
+            ctx_llm_struct_seqs.append(torch.as_tensor(ctx_llm_struct_seq[1:], dtype=ctx_dtype))
+            ctx_llm_struct_feature_seqs.append(torch.as_tensor(ctx_llm_struct_feature_seq[1:], dtype=ctx_dtype))
 
     q_seqs = pad_sequence(q_seqs, batch_first=True, padding_value=pad_val)
     r_seqs = pad_sequence(r_seqs, batch_first=True, padding_value=pad_val)

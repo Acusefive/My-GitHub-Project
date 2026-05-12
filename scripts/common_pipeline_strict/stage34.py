@@ -1077,6 +1077,13 @@ def _enrich_contexts_with_llm_summary(
             record["_llm_key"] = key
             record["_llm_signature_key"] = signature_key
             if llm_summary_text:
+                try:
+                    parse_llm_summary_json(llm_summary_text)
+                except Exception:
+                    llm_cache.pop(key, None)
+                    llm_cache.pop(signature_key, None)
+                    llm_summary_text = ""
+            if llm_summary_text:
                 record["_llm_summary_text"] = llm_summary_text
                 if key not in llm_cache:
                     llm_cache[key] = llm_summary_text

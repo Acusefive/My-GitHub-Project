@@ -11,6 +11,35 @@ from dataloader.context_map import ContextEmbeddingMap
 from scripts.common_pipeline_strict.io_utils import load_problem_records, load_student_sequences
 
 
+def split_new_concepts(
+    all_concepts: Sequence[str],
+    *,
+    seed: int,
+    test_concept_ratio: float,
+    valid_concept_ratio: float,
+) -> Tuple[set[str], set[str], set[str]]:
+    concepts = sorted(str(concept) for concept in all_concepts)
+    shuffled_concepts = np.asarray(concepts, dtype=object)
+    if len(shuffled_concepts) > 0:
+        rng = np.random.default_rng(int(seed))
+        shuffled_concepts = shuffled_concepts[rng.permutation(len(shuffled_concepts))]
+
+    total = len(shuffled_concepts)
+    test_count = max(1, int(total * float(test_concept_ratio))) if total and test_concept_ratio > 0 else 0
+    remaining_after_test = max(0, total - test_count)
+    valid_count = (
+        max(1, int(total * float(valid_concept_ratio)))
+        if remaining_after_test and valid_concept_ratio > 0
+        else 0
+    )
+    valid_count = min(valid_count, remaining_after_test)
+
+    test_concepts = set(shuffled_concepts[:test_count].tolist())
+    valid_concepts = set(shuffled_concepts[test_count : test_count + valid_count].tolist())
+    train_concepts = set(concepts) - test_concepts - valid_concepts
+    return train_concepts, valid_concepts, test_concepts
+
+
 def match_seq_len_with_context(
     q_seqs: Sequence[np.ndarray],
     r_seqs: Sequence[np.ndarray],
@@ -118,6 +147,7 @@ class MOOCRadarStrict(Dataset):
         split_role: str = "all",
         seed: int = 42,
         test_concept_ratio: float = 0.2,
+        valid_concept_ratio: float = 0.0,
         cache_preprocessed: bool = True,
         context_storage_dtype: str = "float32",
     ) -> None:
@@ -135,20 +165,24 @@ class MOOCRadarStrict(Dataset):
         self.split_role = str(split_role)
         self.seed = int(seed)
         self.test_concept_ratio = float(test_concept_ratio)
+        self.valid_concept_ratio = float(valid_concept_ratio)
         self.cache_preprocessed = bool(cache_preprocessed)
         if context_storage_dtype not in {"float32", "float16"}:
             raise ValueError(f"Unsupported context_storage_dtype: {context_storage_dtype}")
         self.context_storage_dtype = np.float16 if context_storage_dtype == "float16" else np.float32
         if self.split_mode not in {"user", "new_concept"}:
             raise ValueError(f"Unsupported split_mode: {self.split_mode}")
-        if self.split_mode == "new_concept" and self.split_role not in {"train_valid", "test"}:
-            raise ValueError("split_role must be train_valid or test when split_mode=new_concept")
+        if self.split_mode == "new_concept" and self.split_role not in {"train", "train_valid", "valid", "test"}:
+            raise ValueError("split_role must be train, train_valid, valid, or test when split_mode=new_concept")
         self.dataset_dir.mkdir(parents=True, exist_ok=True)
 
-        context_tag = f"{self.context_embeddings_path.stem}_{self.context_embeddings_path.stat().st_size}"
+        extra_features_path = self.context_embeddings_path.with_suffix(".extra_features.npy")
+        extra_features_tag = f"_extra{extra_features_path.stat().st_size}" if extra_features_path.exists() else ""
+        context_tag = f"{self.context_embeddings_path.stem}_{self.context_embeddings_path.stat().st_size}{extra_features_tag}"
         split_tag = (
             f"{self.split_mode}_{self.split_role}_seq{self.seq_len}_seed{self.seed}_"
-            f"ratio{str(self.test_concept_ratio).replace('.', 'p')}_ctx{context_storage_dtype}"
+            f"test{str(self.test_concept_ratio).replace('.', 'p')}_"
+            f"valid{str(self.valid_concept_ratio).replace('.', 'p')}_ctx{context_storage_dtype}"
         )
         cache_prefix = self.dataset_dir / f"moocradar_strict_{context_tag}_{split_tag}"
         base_cache = {
@@ -174,7 +208,7 @@ class MOOCRadarStrict(Dataset):
             "split_stats": cache_prefix.with_name(cache_prefix.name + "_split_stats.pkl"),
         }
 
-        self.lazy_test = self.split_mode == "new_concept" and self.split_role == "test"
+        self.lazy_test = self.split_mode == "new_concept" and self.split_role in {"valid", "test"}
         if self.lazy_test:
             self._preprocess_lazy_test()
         elif self.cache_preprocessed and all(path.exists() for path in base_cache.values()):
@@ -370,22 +404,23 @@ class MOOCRadarStrict(Dataset):
         self.zero_struct_feature_ctx = np.zeros((self.llm_struct_feature_dim,), dtype=self.context_storage_dtype)
 
         all_concepts = sorted({concept for concepts in pid2concepts.values() for concept in concepts})
-        rng = np.random.default_rng(self.seed)
-        shuffled_concepts = np.asarray(all_concepts, dtype=object)
-        if len(shuffled_concepts) > 0:
-            shuffled_concepts = shuffled_concepts[rng.permutation(len(shuffled_concepts))]
-        test_concept_count = max(1, int(len(shuffled_concepts) * self.test_concept_ratio)) if len(shuffled_concepts) else 0
-        test_concepts = set(shuffled_concepts[:test_concept_count].tolist())
-        train_concepts = set(all_concepts) - test_concepts
+        train_concepts, valid_concepts, test_concepts = split_new_concepts(
+            all_concepts,
+            seed=self.seed,
+            test_concept_ratio=self.test_concept_ratio,
+            valid_concept_ratio=self.valid_concept_ratio,
+        )
+        target_concepts = test_concepts if self.split_role == "test" else valid_concepts
+        holdout_concepts = valid_concepts | test_concepts
 
         self.lazy_sequences = []
         self.test_samples = []
         self.lazy_sample_user_ids = []
         train_target_concepts = set()
-        test_target_concepts = set()
+        eval_target_concepts = set()
         skipped_test_targets_no_old_history = 0
         train_target_interactions = 0
-        test_target_interactions = 0
+        eval_target_interactions = 0
 
         for sequence in student_sequences:
             raw_filtered_logs = [log for log in sequence.seq if str(log.get("problem_id") or "") in self.q2idx]
@@ -403,16 +438,16 @@ class MOOCRadarStrict(Dataset):
 
             for pos, pid in enumerate(pids):
                 concepts = pid2concepts.get(pid, set())
-                if concepts & test_concepts:
+                if concepts & target_concepts:
                     is_test_target[pos] = True
-                    test_target_concepts.update(concepts & test_concepts)
-                    test_target_interactions += 1
+                    eval_target_concepts.update(concepts & target_concepts)
+                    eval_target_interactions += 1
                     if not has_old_history:
                         skipped_test_targets_no_old_history += 1
                         continue
                     self.test_samples.append((user_idx, pos))
                     self.lazy_sample_user_ids.append(sequence.user_id)
-                else:
+                elif not (concepts & holdout_concepts):
                     old_mask[pos] = True
                     has_old_history = True
                     train_target_concepts.update(concepts & train_concepts)
@@ -436,14 +471,18 @@ class MOOCRadarStrict(Dataset):
             "lazy_test": True,
             "seed": self.seed,
             "test_concept_ratio": self.test_concept_ratio,
+            "valid_concept_ratio": self.valid_concept_ratio,
             "total_concepts": len(all_concepts),
             "configured_train_concepts": len(train_concepts),
+            "configured_valid_concepts": len(valid_concepts),
             "configured_test_concepts": len(test_concepts),
+            "eval_concept_role": self.split_role,
+            "configured_eval_concepts": len(target_concepts),
             "train_target_concepts": len(train_target_concepts),
-            "test_target_concepts": len(test_target_concepts),
-            "train_test_concept_overlap": len(train_target_concepts & test_target_concepts),
+            "eval_target_concepts": len(eval_target_concepts),
+            "train_eval_concept_overlap": len(train_target_concepts & eval_target_concepts),
             "train_target_interactions": train_target_interactions,
-            "test_target_interactions": test_target_interactions,
+            "eval_target_interactions": eval_target_interactions,
             "skipped_test_targets_no_old_history": skipped_test_targets_no_old_history,
             "sequence_count": len(self.test_samples),
         }
@@ -532,19 +571,20 @@ class MOOCRadarStrict(Dataset):
         zero_struct_feature_ctx = np.zeros((context_map.llm_struct_feature_dim,), dtype=self.context_storage_dtype)
 
         all_concepts = sorted({concept for concepts in pid2concepts.values() for concept in concepts})
-        rng = np.random.default_rng(self.seed)
-        shuffled_concepts = np.asarray(all_concepts, dtype=object)
-        if len(shuffled_concepts) > 0:
-            shuffled_concepts = shuffled_concepts[rng.permutation(len(shuffled_concepts))]
-        test_concept_count = max(1, int(len(shuffled_concepts) * self.test_concept_ratio)) if len(shuffled_concepts) else 0
-        test_concepts = set(shuffled_concepts[:test_concept_count].tolist())
-        train_concepts = set(all_concepts) - test_concepts
+        train_concepts, valid_concepts, test_concepts = split_new_concepts(
+            all_concepts,
+            seed=self.seed,
+            test_concept_ratio=self.test_concept_ratio,
+            valid_concept_ratio=self.valid_concept_ratio,
+        )
+        target_concepts = test_concepts if self.split_role == "test" else valid_concepts
+        holdout_concepts = valid_concepts | test_concepts
 
         train_target_concepts = set()
-        test_target_concepts = set()
+        eval_target_concepts = set()
         skipped_test_targets_no_old_history = 0
         train_target_interactions = 0
-        test_target_interactions = 0
+        eval_target_interactions = 0
 
         for sequence in student_sequences:
             raw_filtered_logs = [log for log in sequence.seq if str(log.get("problem_id") or "") in q2idx]
@@ -583,47 +623,52 @@ class MOOCRadarStrict(Dataset):
             for target_t, log in filtered_logs:
                 pid = str(log["problem_id"])
                 concepts = pid2concepts.get(pid, set())
-                is_test_target = bool(concepts & test_concepts)
-                if is_test_target:
-                    test_target_concepts.update(concepts & test_concepts)
-                    test_target_interactions += 1
+                is_eval_target = self.split_role in {"valid", "test"} and bool(concepts & target_concepts)
+                if is_eval_target:
+                    eval_target_concepts.update(concepts & target_concepts)
+                    eval_target_interactions += 1
                     if len(old_history) == 0:
                         skipped_test_targets_no_old_history += 1
                         continue
-                    if self.split_role == "test":
-                        target_logs = (old_history + [(target_t, log)])[-(self.seq_len + 1) :]
-                        arrays = self._build_sequence_arrays(
-                            target_logs,
-                            q2idx,
-                            context_map,
-                            sequence.user_id,
-                            zero_ctx,
-                            zero_struct_ctx,
-                            zero_struct_feature_ctx,
-                        )
-                        eval_mask = np.zeros((len(target_logs),), dtype=np.int64)
-                        eval_mask[-1] = 1
-                        self._append_arrays(
-                            q_seqs,
-                            r_seqs,
-                            eval_mask_seqs,
-                            ctx_main_seqs,
-                            ctx_tpl_seqs,
-                            ctx_llm_seqs,
-                            ctx_llm_struct_seqs,
-                            ctx_llm_struct_feature_seqs,
-                            seq_user_ids,
-                            sequence.user_id,
-                            arrays,
-                            eval_mask,
-                        )
-                else:
+                    target_logs = (old_history + [(target_t, log)])[-(self.seq_len + 1) :]
+                    arrays = self._build_sequence_arrays(
+                        target_logs,
+                        q2idx,
+                        context_map,
+                        sequence.user_id,
+                        zero_ctx,
+                        zero_struct_ctx,
+                        zero_struct_feature_ctx,
+                    )
+                    eval_mask = np.zeros((len(target_logs),), dtype=np.int64)
+                    eval_mask[-1] = 1
+                    self._append_arrays(
+                        q_seqs,
+                        r_seqs,
+                        eval_mask_seqs,
+                        ctx_main_seqs,
+                        ctx_tpl_seqs,
+                        ctx_llm_seqs,
+                        ctx_llm_struct_seqs,
+                        ctx_llm_struct_feature_seqs,
+                        seq_user_ids,
+                        sequence.user_id,
+                        arrays,
+                        eval_mask,
+                    )
+                elif self.split_role == "train_valid" and not (concepts & test_concepts):
                     train_logs.append((target_t, log))
+                    old_history.append((target_t, log))
+                    train_target_concepts.update(concepts & (train_concepts | valid_concepts))
+                    train_target_interactions += 1
+                elif not (concepts & holdout_concepts):
+                    if self.split_role in {"train", "valid", "test"}:
+                        train_logs.append((target_t, log))
                     old_history.append((target_t, log))
                     train_target_concepts.update(concepts & train_concepts)
                     train_target_interactions += 1
 
-            if self.split_role == "train_valid" and len(train_logs) >= 2:
+            if self.split_role in {"train", "train_valid"} and len(train_logs) >= 2:
                 arrays = self._build_sequence_arrays(
                     train_logs,
                     q2idx,
@@ -653,14 +698,18 @@ class MOOCRadarStrict(Dataset):
             "split_role": self.split_role,
             "seed": self.seed,
             "test_concept_ratio": self.test_concept_ratio,
+            "valid_concept_ratio": self.valid_concept_ratio,
             "total_concepts": len(all_concepts),
             "configured_train_concepts": len(train_concepts),
+            "configured_valid_concepts": len(valid_concepts),
             "configured_test_concepts": len(test_concepts),
+            "eval_concept_role": self.split_role if self.split_role in {"valid", "test"} else "",
+            "configured_eval_concepts": len(target_concepts) if self.split_role in {"valid", "test"} else 0,
             "train_target_concepts": len(train_target_concepts),
-            "test_target_concepts": len(test_target_concepts),
-            "train_test_concept_overlap": len(train_target_concepts & test_target_concepts),
+            "eval_target_concepts": len(eval_target_concepts),
+            "train_eval_concept_overlap": len(train_target_concepts & eval_target_concepts),
             "train_target_interactions": train_target_interactions,
-            "test_target_interactions": test_target_interactions,
+            "eval_target_interactions": eval_target_interactions,
             "skipped_test_targets_no_old_history": skipped_test_targets_no_old_history,
             "sequence_count": len(q_seqs),
         }

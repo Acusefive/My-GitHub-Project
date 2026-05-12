@@ -28,6 +28,15 @@ class ContextEmbeddingMap:
             self.llm_struct_embeddings = np.asarray(payload["llm_struct_embeddings"], dtype=np.float32)
         if "llm_struct_features" in payload:
             self.llm_struct_features = np.asarray(payload["llm_struct_features"], dtype=np.float32)
+        extra_features_path = self.embeddings_path.with_suffix(".extra_features.npy")
+        if extra_features_path.exists():
+            extra_features = np.load(extra_features_path).astype(np.float32, copy=False)
+            if len(index) != extra_features.shape[0]:
+                raise ValueError("context extra feature array has inconsistent length")
+            if self.llm_struct_features is None:
+                self.llm_struct_features = extra_features
+            else:
+                self.llm_struct_features = np.concatenate([self.llm_struct_features, extra_features], axis=1).astype(np.float32)
         if len(index) != self.main_embeddings.shape[0] or len(index) != self.template_embeddings.shape[0]:
             raise ValueError("context_embeddings.pkl index and embedding arrays have inconsistent lengths")
         if self.llm_embeddings is not None and len(index) != self.llm_embeddings.shape[0]:

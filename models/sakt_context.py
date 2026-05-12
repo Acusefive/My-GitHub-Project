@@ -3,11 +3,23 @@ import torch
 from torch.nn import Module, Parameter, Embedding, Sequential, Linear, ReLU, MultiheadAttention, LayerNorm, Dropout
 from torch.nn.init import kaiming_normal_
 
-from models.context_fusion import ContextFusion
+from models.context_fusion import ContextFusion, ContextLogitHead
 
 
 class SAKTContext(Module):
-    def __init__(self, num_q, n, d, num_attn_heads, dropout, ctx_dim, fusion_type="gate"):
+    def __init__(
+        self,
+        num_q,
+        n,
+        d,
+        num_attn_heads,
+        dropout,
+        ctx_dim,
+        fusion_type="gate",
+        ctx_encoder_dim=256,
+        ctx_group_dims=None,
+        ctx_logit_hidden_dim=128,
+    ):
         super().__init__()
         self.num_q = num_q
         self.n = n
@@ -34,7 +46,15 @@ class SAKTContext(Module):
             Dropout(self.dropout),
         )
         self.FFN_layer_norm = LayerNorm(self.d)
-        self.context_fusion = ContextFusion(self.d, self.ctx_dim, mode=self.fusion_type)
+        self.context_fusion = ContextFusion(
+            self.d,
+            self.ctx_dim,
+            mode=self.fusion_type,
+            dropout=self.dropout,
+            ctx_encoder_dim=ctx_encoder_dim,
+            ctx_group_dims=ctx_group_dims,
+        )
+        self.context_logit_head = ContextLogitHead(self.context_fusion.ctx_encoder_dim, ctx_logit_hidden_dim, dropout=self.dropout)
         self.pred = Linear(self.d, 1)
 
     def forward(self, q, r, qry, ctx=None):
@@ -58,8 +78,14 @@ class SAKTContext(Module):
         F = self.FFN(S)
         F = self.FFN_layer_norm(F + S)
 
+        ctx_logits = None
         if ctx is not None:
-            F = self.context_fusion(F, ctx)
+            ctx_encoded = self.context_fusion.encode_context(ctx)
+            ctx_logits = self.context_logit_head(ctx_encoded)
+            F = self.context_fusion(F, ctx, ctx_encoded=ctx_encoded)
 
-        p = torch.sigmoid(self.pred(F)).squeeze(-1)
+        logits = self.pred(F).squeeze(-1)
+        if ctx_logits is not None:
+            logits = logits + ctx_logits
+        p = torch.sigmoid(logits)
         return p

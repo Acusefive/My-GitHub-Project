@@ -15,10 +15,13 @@ class SAKTContext(Module):
         num_attn_heads,
         dropout,
         ctx_dim,
-        fusion_type="gate",
+        fusion_type="residual_gate",
         ctx_encoder_dim=256,
         ctx_group_dims=None,
         ctx_logit_hidden_dim=128,
+        ctx_logit_mode="scaled",
+        ctx_logit_init=-3.0,
+        gate_bias_init=-2.0,
     ):
         super().__init__()
         self.num_q = num_q
@@ -53,8 +56,15 @@ class SAKTContext(Module):
             dropout=self.dropout,
             ctx_encoder_dim=ctx_encoder_dim,
             ctx_group_dims=ctx_group_dims,
+            gate_bias_init=gate_bias_init,
         )
-        self.context_logit_head = ContextLogitHead(self.context_fusion.ctx_encoder_dim, ctx_logit_hidden_dim, dropout=self.dropout)
+        self.context_logit_head = ContextLogitHead(
+            self.context_fusion.ctx_encoder_dim,
+            ctx_logit_hidden_dim,
+            dropout=self.dropout,
+            ctx_logit_mode=ctx_logit_mode,
+            ctx_logit_init=ctx_logit_init,
+        )
         self.pred = Linear(self.d, 1)
 
     def forward(self, q, r, qry, ctx=None):
@@ -85,7 +95,6 @@ class SAKTContext(Module):
             F = self.context_fusion(F, ctx, ctx_encoded=ctx_encoded)
 
         logits = self.pred(F).squeeze(-1)
-        if ctx_logits is not None:
-            logits = logits + ctx_logits
+        logits = self.context_logit_head.apply_to_logits(logits, ctx_logits)
         p = torch.sigmoid(logits)
         return p

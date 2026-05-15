@@ -1,6 +1,6 @@
 import torch
 
-from torch.nn import Dropout, GELU, LayerNorm, Linear, Module, ModuleList, Parameter, ReLU, Sequential
+from torch.nn import Dropout, GELU, LayerNorm, Linear, Module, ModuleList, Parameter, ReLU, Sequential, Sigmoid
 
 
 class ContextEncoder(Module):
@@ -71,12 +71,19 @@ class ContextFusion(Module):
         dropout: float = 0.1,
         ctx_encoder_dim: int = 256,
         ctx_group_dims: tuple[int, ...] | None = None,
+        gate_bias_init: float = -2.0,
+        fusion_mode: str | None = None,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.ctx_dim = int(ctx_dim)
         self.ctx_encoder_dim = int(ctx_encoder_dim)
+        if fusion_mode is not None:
+            if mode != "gate" and str(mode) != str(fusion_mode):
+                raise ValueError(f"Conflicting fusion modes: mode={mode}, fusion_mode={fusion_mode}")
+            mode = str(fusion_mode)
         self.mode = str(mode)
+        self.gate_bias_init = float(gate_bias_init)
         self.ctx_encoder = ContextEncoder(
             self.ctx_dim,
             encoder_dim=self.ctx_encoder_dim,
@@ -87,10 +94,18 @@ class ContextFusion(Module):
         self.out_norm = LayerNorm(self.hidden_dim)
         if self.mode == "concat":
             self.concat_proj = Linear(self.hidden_dim + self.ctx_encoder_dim, self.hidden_dim)
-        elif self.mode in {"gate", "residual_gate"}:
+        elif self.mode == "gate":
             self.gate_proj = Linear(self.hidden_dim * 2, self.hidden_dim)
-            if self.mode == "residual_gate":
-                torch.nn.init.constant_(self.gate_proj.bias, -1.0)
+        elif self.mode == "residual_gate":
+            self.gate_net = Sequential(
+                Linear(self.hidden_dim * 2, self.hidden_dim),
+                ReLU(),
+                Dropout(float(dropout)),
+                Linear(self.hidden_dim, self.hidden_dim),
+                Sigmoid(),
+            )
+            final_gate_linear = self.gate_net[-2]
+            torch.nn.init.constant_(final_gate_linear.bias, self.gate_bias_init)
         elif self.mode == "add":
             pass
         else:
@@ -150,6 +165,10 @@ class ContextFusion(Module):
         if ctx_encoded is None:
             return hidden
         ctx_hidden = self.ctx_proj(ctx_encoded)
+        if hidden.shape[-1] != self.hidden_dim:
+            raise ValueError(f"hidden last dim must be {self.hidden_dim}, got {hidden.shape[-1]}")
+        if hidden.shape[:-1] != ctx_hidden.shape[:-1]:
+            raise ValueError(f"hidden and context leading dims must match, got {hidden.shape} and {ctx_hidden.shape}")
         if self.mode == "add":
             fused = hidden + ctx_hidden
         elif self.mode == "concat":
@@ -158,18 +177,30 @@ class ContextFusion(Module):
             gate = torch.sigmoid(self.gate_proj(torch.cat([hidden, ctx_hidden], dim=-1)))
             self._record_gate_stats(gate, 1.0 - gate)
             fused = gate * hidden + (1.0 - gate) * ctx_hidden
+            return self.out_norm(fused)
         else:
-            gate = torch.sigmoid(self.gate_proj(torch.cat([hidden, ctx_hidden], dim=-1)))
+            gate = self.gate_net(torch.cat([hidden, ctx_hidden], dim=-1))
             self._record_gate_stats(gate, gate)
             fused = hidden + gate * ctx_hidden
+            return fused
         return self.out_norm(fused)
 
 
 class ContextLogitHead(Module):
-    def __init__(self, ctx_dim: int, hidden_dim: int, dropout: float = 0.1) -> None:
+    def __init__(
+        self,
+        ctx_dim: int,
+        hidden_dim: int,
+        dropout: float = 0.1,
+        ctx_logit_mode: str = "scaled",
+        ctx_logit_init: float = -3.0,
+    ) -> None:
         super().__init__()
         self.ctx_dim = int(ctx_dim)
         self.hidden_dim = int(hidden_dim)
+        self.ctx_logit_mode = str(ctx_logit_mode)
+        if self.ctx_logit_mode not in {"none", "raw", "scaled"}:
+            raise ValueError(f"Unsupported ctx_logit_mode: {self.ctx_logit_mode}")
         self.net = Sequential(
             LayerNorm(self.ctx_dim),
             Linear(self.ctx_dim, self.hidden_dim),
@@ -177,9 +208,35 @@ class ContextLogitHead(Module):
             Dropout(float(dropout)),
             Linear(self.hidden_dim, 1),
         )
-        self.scale = Parameter(torch.tensor(0.1))
+        self.scale = Parameter(torch.tensor(float(ctx_logit_init)))
+
+    @property
+    def ctx_logit_scale(self) -> Parameter:
+        return self.scale
+
+    def effective_scale(self) -> torch.Tensor:
+        if self.ctx_logit_mode == "none":
+            return self.scale.new_tensor(0.0)
+        if self.ctx_logit_mode == "raw":
+            return self.scale.new_tensor(1.0)
+        return torch.sigmoid(self.ctx_logit_scale)
+
+    def get_usage_stats(self) -> dict[str, float | str]:
+        scale = self.effective_scale()
+        return {
+            "ctx_logit_mode": self.ctx_logit_mode,
+            "ctx_logit_scale": float(scale.detach().cpu().item()),
+            "ctx_logit_scale_logit": float(self.ctx_logit_scale.detach().cpu().item()),
+        }
 
     def forward(self, ctx: torch.Tensor | None) -> torch.Tensor | None:
-        if ctx is None:
+        if ctx is None or self.ctx_logit_mode == "none":
             return None
-        return self.scale * self.net(ctx).squeeze(-1)
+        return self.net(ctx).squeeze(-1)
+
+    def apply_to_logits(self, logits: torch.Tensor, ctx_logits: torch.Tensor | None) -> torch.Tensor:
+        if ctx_logits is None or self.ctx_logit_mode == "none":
+            return logits
+        if self.ctx_logit_mode == "raw":
+            return logits + ctx_logits
+        return logits + self.effective_scale() * ctx_logits

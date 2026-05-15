@@ -47,9 +47,12 @@ def get_context_fusion_stats(model) -> Dict[str, float]:
     if fusion is not None and hasattr(fusion, "get_usage_stats"):
         stats.update(dict(fusion.get_usage_stats()))
     context_logit_head = getattr(model, "context_logit_head", None)
-    context_logit_scale = getattr(context_logit_head, "scale", None)
-    if context_logit_scale is not None:
-        stats["context_logit_scale"] = float(context_logit_scale.detach().cpu().item())
+    if context_logit_head is not None and hasattr(context_logit_head, "get_usage_stats"):
+        stats.update(dict(context_logit_head.get_usage_stats()))
+    else:
+        context_logit_scale = getattr(context_logit_head, "scale", None)
+        if context_logit_scale is not None:
+            stats["context_logit_scale"] = float(context_logit_scale.detach().cpu().item())
     return stats
 
 
@@ -75,6 +78,16 @@ def select_context(
         if ctx_llm_struct_features is None or ctx_llm_struct_features.shape[-1] == 0:
             raise ValueError("Requested llm context but llm structured feature tensor is missing")
         return torch.cat([ctx_llm, ctx_llm_struct, ctx_llm_struct_features], dim=-1)
+    if context_type == "all":
+        if ctx_main is None or ctx_tpl is None:
+            raise ValueError("Requested all context but main/template context tensors are missing")
+        if ctx_llm is None:
+            raise ValueError("Requested all context but llm text embedding tensor is missing")
+        if ctx_llm_struct is None or ctx_llm_struct.shape[-1] == 0:
+            raise ValueError("Requested all context but llm structured embedding tensor is missing")
+        if ctx_llm_struct_features is None or ctx_llm_struct_features.shape[-1] == 0:
+            raise ValueError("Requested all context but llm structured feature tensor is missing")
+        return torch.cat([ctx_main, ctx_tpl, ctx_llm, ctx_llm_struct, ctx_llm_struct_features], dim=-1)
     raise ValueError(f"Unsupported context_type: {context_type}")
 
 
@@ -87,6 +100,9 @@ def build_model(
     *,
     ctx_encoder_dim: int = 256,
     ctx_logit_hidden_dim: int = 128,
+    ctx_logit_mode: str = "scaled",
+    ctx_logit_init: float = -3.0,
+    gate_bias_init: float = -2.0,
 ):
     config = dict(model_config)
     ctx_dim = dataset.context_dim
@@ -100,9 +116,27 @@ def build_model(
             + llm_struct_feature_dim
         )
         ctx_group_dims = (int(dataset.context_dim), llm_struct_dim, llm_struct_feature_dim)
+    elif context_type == "all":
+        llm_struct_dim = int(getattr(dataset, "llm_struct_dim", 0))
+        llm_struct_feature_dim = int(getattr(dataset, "llm_struct_feature_dim", 0))
+        ctx_dim = int(
+            dataset.context_dim * 3
+            + llm_struct_dim
+            + llm_struct_feature_dim
+        )
+        ctx_group_dims = (
+            int(dataset.context_dim),
+            int(dataset.context_dim),
+            int(dataset.context_dim),
+            llm_struct_dim,
+            llm_struct_feature_dim,
+        )
     config["ctx_encoder_dim"] = int(ctx_encoder_dim)
     config["ctx_group_dims"] = ctx_group_dims
     config["ctx_logit_hidden_dim"] = int(ctx_logit_hidden_dim)
+    config["ctx_logit_mode"] = str(ctx_logit_mode)
+    config["ctx_logit_init"] = float(ctx_logit_init)
+    config["gate_bias_init"] = float(gate_bias_init)
     if model_name == "dkt":
         return DKTContext(dataset.num_q, ctx_dim=ctx_dim, fusion_type=fusion_type, **config)
     if model_name == "sakt":
@@ -247,7 +281,8 @@ def train(
     amp_enabled: bool = False,
 ):
     history = []
-    best_auc = -1.0
+    no_validation = valid_loader is None
+    best_auc = float("nan") if no_validation else -1.0
     best_epoch = -1
     best_metrics: Dict[str, float] | None = None
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -290,6 +325,46 @@ def train(
 
         train_loss = float(np.mean(batch_losses)) if batch_losses else 0.0
         train_context_fusion = get_context_fusion_stats(model)
+        if no_validation:
+            best_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), best_path)
+            best_epoch = epoch
+            history.append(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "train_context_fusion": train_context_fusion,
+                    "eval_metrics": None,
+                    "skipped_eval": True,
+                    "no_validation": True,
+                }
+            )
+            train_logit_summary = ""
+            train_gate_summary = ""
+            if context_type != "none":
+                if "ctx_logit_scale" in train_context_fusion:
+                    train_logit_summary = (
+                        ", Train CtxLogitMode: {mode}, Train CtxLogitScale: {scale:.4f}"
+                    ).format(
+                        mode=str(train_context_fusion.get("ctx_logit_mode", "unknown")),
+                        scale=float(train_context_fusion["ctx_logit_scale"]),
+                    )
+                if train_context_fusion.get("fusion_mode") in {"gate", "residual_gate"} and int(train_context_fusion.get("usage_steps", 0)) > 0:
+                    train_gate_summary = (
+                        ", Train Gate Mean: {gate_mean:.4f}, Train Ctx Weight: {ctx_weight_mean:.4f}, "
+                        "Train Gate<0.1: {gate_low:.4f}, Train Gate>0.9: {gate_high:.4f}"
+                    ).format(
+                        gate_mean=float(train_context_fusion["gate_mean"]),
+                        ctx_weight_mean=float(train_context_fusion["ctx_weight_mean"]),
+                        gate_low=float(train_context_fusion["gate_lt_0_1_frac"]),
+                        gate_high=float(train_context_fusion["gate_gt_0_9_frac"]),
+                    )
+            print(
+                f"Epoch: {epoch}, Train Loss: {train_loss:.6f}, Valid: disabled"
+                f"{train_gate_summary}{train_logit_summary}"
+            )
+            continue
+
         should_eval = (epoch % eval_interval == 0) or (epoch == num_epochs)
         if not should_eval:
             history.append(
@@ -316,7 +391,16 @@ def train(
         )
         train_gate_summary = ""
         eval_gate_summary = ""
+        train_logit_summary = ""
+        eval_logit_summary = ""
         if context_type != "none":
+            if "ctx_logit_scale" in train_context_fusion:
+                train_logit_summary = (
+                    ", Train CtxLogitMode: {mode}, Train CtxLogitScale: {scale:.4f}"
+                ).format(
+                    mode=str(train_context_fusion.get("ctx_logit_mode", "unknown")),
+                    scale=float(train_context_fusion["ctx_logit_scale"]),
+                )
             if train_context_fusion.get("fusion_mode") in {"gate", "residual_gate"} and int(train_context_fusion.get("usage_steps", 0)) > 0:
                 train_gate_summary = (
                     ", Train Gate Mean: {gate_mean:.4f}, Train Ctx Weight: {ctx_weight_mean:.4f}, "
@@ -328,6 +412,13 @@ def train(
                     gate_high=float(train_context_fusion["gate_gt_0_9_frac"]),
                 )
             eval_context_fusion = eval_metrics.get("context_fusion") or {}
+            if "ctx_logit_scale" in eval_context_fusion:
+                eval_logit_summary = (
+                    ", Eval CtxLogitMode: {mode}, Eval CtxLogitScale: {scale:.4f}"
+                ).format(
+                    mode=str(eval_context_fusion.get("ctx_logit_mode", "unknown")),
+                    scale=float(eval_context_fusion["ctx_logit_scale"]),
+                )
             if eval_context_fusion.get("fusion_mode") in {"gate", "residual_gate"} and int(eval_context_fusion.get("usage_steps", 0)) > 0:
                 eval_gate_summary = (
                     ", Eval Gate Mean: {gate_mean:.4f}, Eval Ctx Weight: {ctx_weight_mean:.4f}, "
@@ -341,7 +432,7 @@ def train(
         print(
             "Epoch: {epoch}, Valid AUC: {auc:.6f}, Valid ACC: {acc:.6f}, Valid F1: {f1:.6f}, "
             "BCE: {bce:.6f}, RMSE: {rmse:.6f}, Train Loss: {train_loss:.6f}, Valid Loss: {eval_loss:.6f}"
-            "{train_gate_summary}{eval_gate_summary}".format(
+            "{train_gate_summary}{eval_gate_summary}{train_logit_summary}{eval_logit_summary}".format(
                 epoch=epoch,
                 auc=float(eval_metrics["auc"]) if not math.isnan(float(eval_metrics["auc"])) else float("nan"),
                 acc=float(eval_metrics["acc"]),
@@ -352,6 +443,8 @@ def train(
                 eval_loss=float(eval_metrics["loss_mean"]),
                 train_gate_summary=train_gate_summary,
                 eval_gate_summary=eval_gate_summary,
+                train_logit_summary=train_logit_summary,
+                eval_logit_summary=eval_logit_summary,
             )
         )
 
@@ -360,6 +453,7 @@ def train(
             best_auc = eval_auc
             best_epoch = epoch
             best_metrics = dict(eval_metrics)
+            best_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), best_path)
         if patience > 0 and best_epoch > 0 and epoch - best_epoch >= patience:
             print(f"Early stopping at epoch {epoch}; best_epoch={best_epoch}, best_valid_auc={best_auc:.6f}")
@@ -378,6 +472,8 @@ def train(
             "sample_count": 0,
             "positive_rate": float("nan"),
             "loss_mean": float("nan"),
+            "selection": "last_epoch_no_validation" if no_validation else "none",
+            "best_epoch": int(best_epoch),
         }
 
     return history, best_auc, best_path, best_metrics
@@ -387,8 +483,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     workspace = Path(__file__).resolve().parent
     parser.add_argument("--model_name", type=str, default="dkt", choices=["dkt", "sakt", "saint"])
-    parser.add_argument("--context_type", type=str, default="llm", choices=["none", "main", "template", "llm"])
-    parser.add_argument("--fusion_type", type=str, default="gate", choices=["add", "concat", "gate", "residual_gate"])
+    parser.add_argument("--context_type", type=str, default="llm", choices=["none", "main", "template", "llm", "all"])
+    parser.add_argument(
+        "--fusion_type",
+        "--fusion_mode",
+        dest="fusion_type",
+        type=str,
+        default="residual_gate",
+        choices=["add", "concat", "gate", "residual_gate"],
+    )
     parser.add_argument("--problem_json", type=str, default=str(workspace / "datalocal" / "problem.json"))
     parser.add_argument("--student_json", type=str, default=str(workspace / "datalocal" / "student-problem-fine.json"))
     parser.add_argument(
@@ -410,7 +513,7 @@ def main() -> None:
     parser.add_argument("--split_mode", type=str, default="user", choices=["user", "new_concept"])
     parser.add_argument("--test_concept_ratio", type=float, default=0.2)
     parser.add_argument("--valid_concept_ratio", type=float, default=0.0)
-    parser.add_argument("--valid_ratio", type=float, default=0.1)
+    parser.add_argument("--valid_ratio", type=float, default=0.0)
     parser.add_argument("--cache_dataset", action="store_true")
     parser.add_argument("--eval_only", action="store_true")
     parser.add_argument("--eval_ckpt", type=str, default=None)
@@ -427,6 +530,9 @@ def main() -> None:
     parser.add_argument("--test_limit", type=int, default=0)
     parser.add_argument("--ctx_encoder_dim", type=int, default=256)
     parser.add_argument("--ctx_logit_hidden_dim", type=int, default=128)
+    parser.add_argument("--ctx_logit_mode", type=str, default="scaled", choices=["none", "raw", "scaled"])
+    parser.add_argument("--ctx_logit_init", type=float, default=-3.0)
+    parser.add_argument("--gate_bias_init", type=float, default=-2.0)
     args = parser.parse_args()
 
     if args.cpu_threads is not None:
@@ -456,9 +562,9 @@ def main() -> None:
         "student_json": args.student_json,
         "context_embeddings_path": args.context_embeddings_path,
         "dataset_dir": args.dataset_dir,
-        "require_llm_context": (args.context_type == "llm"),
-        "require_llm_struct_context": (args.context_type == "llm"),
-        "require_llm_struct_feature_context": (args.context_type == "llm"),
+        "require_llm_context": (args.context_type in {"llm", "all"}),
+        "require_llm_struct_context": (args.context_type in {"llm", "all"}),
+        "require_llm_struct_feature_context": (args.context_type in {"llm", "all"}),
         "split_mode": args.split_mode,
         "seed": int(args.seed),
         "test_concept_ratio": float(args.test_concept_ratio),
@@ -470,18 +576,18 @@ def main() -> None:
     if args.eval_only:
         eval_role = "test" if args.split_mode == "new_concept" else "all"
         dataset = MOOCRadarStrict(**dataset_kwargs, split_role=eval_role)
-        if args.context_type == "llm" and not dataset.has_llm_context:
-            raise ValueError("Requested context_type=llm but context_embeddings.pkl does not contain llm_embeddings")
-        if args.context_type == "llm" and not getattr(dataset, "has_llm_struct_context", False):
-            raise ValueError("Requested context_type=llm but context_embeddings.pkl does not contain llm_struct_embeddings")
-        if args.context_type == "llm" and not getattr(dataset, "has_llm_struct_feature_context", False):
-            raise ValueError("Requested context_type=llm but context_embeddings.pkl does not contain llm_struct_features")
+        if args.context_type in {"llm", "all"} and not dataset.has_llm_context:
+            raise ValueError(f"Requested context_type={args.context_type} but context_embeddings.pkl does not contain llm_embeddings")
+        if args.context_type in {"llm", "all"} and not getattr(dataset, "has_llm_struct_context", False):
+            raise ValueError(f"Requested context_type={args.context_type} but context_embeddings.pkl does not contain llm_struct_embeddings")
+        if args.context_type in {"llm", "all"} and not getattr(dataset, "has_llm_struct_feature_context", False):
+            raise ValueError(f"Requested context_type={args.context_type} but context_embeddings.pkl does not contain llm_struct_features")
 
         eval_split_stats = getattr(dataset, "split_stats", {})
         device = "cuda" if torch.cuda.is_available() else "cpu"
         amp_enabled = bool(args.amp and device == "cuda")
         context_tensor_dtype = "float16" if amp_enabled and args.context_storage_dtype == "float16" else "float32"
-        effective_num_workers = int(args.num_workers) if args.num_workers is not None else (0 if args.context_type == "llm" else 4)
+        effective_num_workers = int(args.num_workers) if args.num_workers is not None else (0 if args.context_type in {"llm", "all"} else 4)
         effective_batch_size = int(train_config["batch_size"])
         effective_eval_batch_size = int(args.eval_batch_size) if args.eval_batch_size is not None else effective_batch_size
         full_eval_len = len(dataset)
@@ -501,6 +607,9 @@ def main() -> None:
             args.context_type,
             ctx_encoder_dim=int(args.ctx_encoder_dim),
             ctx_logit_hidden_dim=int(args.ctx_logit_hidden_dim),
+            ctx_logit_mode=args.ctx_logit_mode,
+            ctx_logit_init=float(args.ctx_logit_init),
+            gate_bias_init=float(args.gate_bias_init),
         ).to(device)
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
         eval_loader = DataLoader(
@@ -534,6 +643,9 @@ def main() -> None:
                     "context_tensor_dtype": context_tensor_dtype,
                     "ctx_encoder_dim": int(args.ctx_encoder_dim),
                     "ctx_logit_hidden_dim": int(args.ctx_logit_hidden_dim),
+                    "ctx_logit_mode": args.ctx_logit_mode,
+                    "ctx_logit_init": float(args.ctx_logit_init),
+                    "gate_bias_init": float(args.gate_bias_init),
                     "amp": amp_enabled,
                     "full_test_len": int(full_eval_len),
                     "test_len": len(dataset),
@@ -561,6 +673,7 @@ def main() -> None:
         print("[MODEL]", args.model_name)
         print("[CONTEXT]", args.context_type)
         print("[FUSION]", args.fusion_type)
+        print("[CTX_LOGIT_MODE]", args.ctx_logit_mode)
         print("[SPLIT_MODE]", args.split_mode)
         print("[TEST_AUC]", test_metrics.get("auc"))
         print("[TEST_ACC]", test_metrics.get("acc"))
@@ -568,6 +681,11 @@ def main() -> None:
         return
 
     use_concept_valid = args.split_mode == "new_concept" and float(args.valid_concept_ratio) > 0.0
+    use_no_validation = (
+        args.split_mode == "new_concept"
+        and float(args.valid_concept_ratio) <= 0.0
+        and float(args.valid_ratio) <= 0.0
+    )
     concept_valid_dataset = None
     if use_concept_valid:
         dataset = MOOCRadarStrict(**dataset_kwargs, split_role="train")
@@ -578,33 +696,39 @@ def main() -> None:
                 "increase --valid_concept_ratio or use --valid_concept_ratio 0.0"
             )
         final_test_dataset = None
+    elif use_no_validation:
+        dataset = MOOCRadarStrict(**dataset_kwargs, split_role="train")
+        final_test_dataset = None
     elif args.split_mode == "new_concept":
         dataset = MOOCRadarStrict(**dataset_kwargs, split_role="train_valid")
         final_test_dataset = None
     else:
         dataset = MOOCRadarStrict(**dataset_kwargs, split_role="all")
         final_test_dataset = None
-    if args.context_type == "llm" and not dataset.has_llm_context:
-        raise ValueError("Requested context_type=llm but context_embeddings.pkl does not contain llm_embeddings")
-    if args.context_type == "llm" and not getattr(dataset, "has_llm_struct_context", False):
-        raise ValueError("Requested context_type=llm but context_embeddings.pkl does not contain llm_struct_embeddings")
-    if args.context_type == "llm" and not getattr(dataset, "has_llm_struct_feature_context", False):
-        raise ValueError("Requested context_type=llm but context_embeddings.pkl does not contain llm_struct_features")
+    if args.context_type in {"llm", "all"} and not dataset.has_llm_context:
+        raise ValueError(f"Requested context_type={args.context_type} but context_embeddings.pkl does not contain llm_embeddings")
+    if args.context_type in {"llm", "all"} and not getattr(dataset, "has_llm_struct_context", False):
+        raise ValueError(f"Requested context_type={args.context_type} but context_embeddings.pkl does not contain llm_struct_embeddings")
+    if args.context_type in {"llm", "all"} and not getattr(dataset, "has_llm_struct_feature_context", False):
+        raise ValueError(f"Requested context_type={args.context_type} but context_embeddings.pkl does not contain llm_struct_features")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     amp_enabled = bool(args.amp and device == "cuda")
     context_tensor_dtype = "float16" if amp_enabled and args.context_storage_dtype == "float16" else "float32"
-    effective_num_workers = int(args.num_workers) if args.num_workers is not None else (0 if args.context_type == "llm" else 4)
+    effective_num_workers = int(args.num_workers) if args.num_workers is not None else (0 if args.context_type in {"llm", "all"} else 4)
     effective_batch_size = int(train_config["batch_size"])
     effective_eval_batch_size = int(args.eval_batch_size) if args.eval_batch_size is not None else effective_batch_size
     print(
         f"[train_context] model={args.model_name} context_type={args.context_type} "
         f"split_mode={args.split_mode} "
-        f"test_concept_ratio={float(args.test_concept_ratio)} valid_concept_ratio={float(args.valid_concept_ratio)} "
+        f"test_concept_ratio={float(args.test_concept_ratio)} valid_ratio={float(args.valid_ratio)} "
+        f"valid_concept_ratio={float(args.valid_concept_ratio)} validation_disabled={use_no_validation} "
         f"batch_size={effective_batch_size} eval_batch_size={effective_eval_batch_size} num_workers={effective_num_workers} "
         f"cpu_threads={args.cpu_threads} context_storage_dtype={args.context_storage_dtype} "
         f"context_tensor_dtype={context_tensor_dtype} valid_limit={int(args.valid_limit)} test_limit={int(args.test_limit)} "
         f"ctx_encoder_dim={int(args.ctx_encoder_dim)} ctx_logit_hidden_dim={int(args.ctx_logit_hidden_dim)} "
+        f"ctx_logit_mode={args.ctx_logit_mode} ctx_logit_init={float(args.ctx_logit_init)} "
+        f"gate_bias_init={float(args.gate_bias_init)} "
         f"patience={args.patience} eval_interval={args.eval_interval} amp={amp_enabled} "
         f"context_dim={dataset.context_dim} llm_struct_dim={getattr(dataset, 'llm_struct_dim', 0)} "
         f"llm_struct_feature_dim={getattr(dataset, 'llm_struct_feature_dim', 0)}",
@@ -615,10 +739,21 @@ def main() -> None:
         valid_dataset = concept_valid_dataset
         split_stats = {
             "split_mode": args.split_mode,
+            "validation_disabled": False,
             "valid_ratio": None,
             "valid_concept_ratio": float(args.valid_concept_ratio),
             "train_dataset_stats": getattr(dataset, "split_stats", {}),
             "valid_dataset_stats": getattr(valid_dataset, "split_stats", {}),
+        }
+    elif use_no_validation:
+        train_dataset = dataset
+        valid_dataset = None
+        split_stats = {
+            "split_mode": args.split_mode,
+            "validation_disabled": True,
+            "valid_ratio": 0.0,
+            "valid_concept_ratio": 0.0,
+            "train_dataset_stats": getattr(dataset, "split_stats", {}),
         }
     else:
         valid_tag = str(float(args.valid_ratio)).replace(".", "p")
@@ -631,15 +766,17 @@ def main() -> None:
         split_stats.update(
             {
                 "split_mode": args.split_mode,
+                "validation_disabled": False,
                 "valid_ratio": float(args.valid_ratio),
                 "valid_concept_ratio": float(args.valid_concept_ratio),
                 "train_valid_dataset_stats": getattr(dataset, "split_stats", {}),
             }
         )
-    full_valid_len = len(valid_dataset)
-    valid_dataset = limit_dataset(valid_dataset, int(args.valid_limit), int(args.seed) + 17)
+    full_valid_len = len(valid_dataset) if valid_dataset is not None else 0
+    if valid_dataset is not None:
+        valid_dataset = limit_dataset(valid_dataset, int(args.valid_limit), int(args.seed) + 17)
     split_stats["full_valid_len"] = int(full_valid_len)
-    split_stats["valid_eval_len"] = int(len(valid_dataset))
+    split_stats["valid_eval_len"] = int(len(valid_dataset)) if valid_dataset is not None else 0
     split_stats["valid_limit"] = int(args.valid_limit)
 
     train_loader = DataLoader(
@@ -655,19 +792,21 @@ def main() -> None:
         pin_memory=(device == "cuda"),
         persistent_workers=(effective_num_workers > 0),
     )
-    valid_loader = DataLoader(
-        valid_dataset,
-        batch_size=effective_eval_batch_size,
-        shuffle=False,
-        collate_fn=partial(
-            collate_fn_with_context,
-            context_type=args.context_type,
-            context_tensor_dtype=context_tensor_dtype,
-        ),
-        num_workers=max(0, effective_num_workers),
-        pin_memory=(device == "cuda"),
-        persistent_workers=(effective_num_workers > 0),
-    )
+    valid_loader = None
+    if valid_dataset is not None:
+        valid_loader = DataLoader(
+            valid_dataset,
+            batch_size=effective_eval_batch_size,
+            shuffle=False,
+            collate_fn=partial(
+                collate_fn_with_context,
+                context_type=args.context_type,
+                context_tensor_dtype=context_tensor_dtype,
+            ),
+            num_workers=max(0, effective_num_workers),
+            pin_memory=(device == "cuda"),
+            persistent_workers=(effective_num_workers > 0),
+        )
     if args.model_name in ("sakt", "saint"):
         model_config["n"] = seq_len
 
@@ -679,6 +818,9 @@ def main() -> None:
         args.context_type,
         ctx_encoder_dim=int(args.ctx_encoder_dim),
         ctx_logit_hidden_dim=int(args.ctx_logit_hidden_dim),
+        ctx_logit_mode=args.ctx_logit_mode,
+        ctx_logit_init=float(args.ctx_logit_init),
+        gate_bias_init=float(args.gate_bias_init),
     ).to(device)
 
     optimizer_name = str(train_config["optimizer"]).lower()
@@ -707,7 +849,7 @@ def main() -> None:
     )
     train_valid_dataset_len = len(train_dataset) + int(full_valid_len)
     train_len = len(train_dataset)
-    valid_len = len(valid_dataset)
+    valid_len = len(valid_dataset) if valid_dataset is not None else 0
     context_info = {
         "context_dim": dataset.context_dim,
         "has_llm_context": dataset.has_llm_context,
@@ -760,6 +902,9 @@ def main() -> None:
                 "device": device,
                 "cpu_threads": args.cpu_threads,
                 "valid_concept_ratio": float(args.valid_concept_ratio),
+                "valid_ratio": float(args.valid_ratio),
+                "validation_disabled": bool(use_no_validation),
+                "checkpoint_selection": "last_epoch" if use_no_validation else "best_valid_auc",
                 "context_storage_dtype": args.context_storage_dtype,
                 "patience": int(args.patience),
                 "eval_interval": int(args.eval_interval),
@@ -767,6 +912,9 @@ def main() -> None:
                 "context_tensor_dtype": context_tensor_dtype,
                 "ctx_encoder_dim": int(args.ctx_encoder_dim),
                 "ctx_logit_hidden_dim": int(args.ctx_logit_hidden_dim),
+                "ctx_logit_mode": args.ctx_logit_mode,
+                "ctx_logit_init": float(args.ctx_logit_init),
+                "gate_bias_init": float(args.gate_bias_init),
                 "amp": amp_enabled,
                 "train_valid_dataset_len": train_valid_dataset_len,
                 "train_len": train_len,
@@ -794,8 +942,9 @@ def main() -> None:
     print("[MODEL]", args.model_name)
     print("[CONTEXT]", args.context_type)
     print("[FUSION]", args.fusion_type)
+    print("[CTX_LOGIT_MODE]", args.ctx_logit_mode)
     print("[SPLIT_MODE]", args.split_mode)
-    print("[BEST_VALID_AUC]", best_auc)
+    print("[BEST_VALID_AUC]", "disabled" if use_no_validation else best_auc)
     print("[TEST_AUC]", test_metrics.get("auc"))
     print("[TEST_ACC]", test_metrics.get("acc"))
     print("[METRICS]", metrics_path)

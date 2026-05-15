@@ -16,10 +16,13 @@ class SAINTContext(Module):
         dropout,
         ctx_dim,
         num_tr_layers=1,
-        fusion_type="gate",
+        fusion_type="residual_gate",
         ctx_encoder_dim=256,
         ctx_group_dims=None,
         ctx_logit_hidden_dim=128,
+        ctx_logit_mode="scaled",
+        ctx_logit_init=-3.0,
+        gate_bias_init=-2.0,
     ):
         super().__init__()
         self.num_q = num_q
@@ -53,8 +56,15 @@ class SAINTContext(Module):
             dropout=self.dropout,
             ctx_encoder_dim=ctx_encoder_dim,
             ctx_group_dims=ctx_group_dims,
+            gate_bias_init=gate_bias_init,
         )
-        self.context_logit_head = ContextLogitHead(self.context_fusion.ctx_encoder_dim, ctx_logit_hidden_dim, dropout=self.dropout)
+        self.context_logit_head = ContextLogitHead(
+            self.context_fusion.ctx_encoder_dim,
+            ctx_logit_hidden_dim,
+            dropout=self.dropout,
+            ctx_logit_mode=ctx_logit_mode,
+            ctx_logit_init=ctx_logit_init,
+        )
         self.fuse_norm = LayerNorm(self.d)
         self.fuse_dropout = Dropout(self.dropout)
         self.pred = Linear(self.d, 1)
@@ -79,7 +89,6 @@ class SAINTContext(Module):
             out = self.fuse_dropout(out)
 
         logits = self.pred(out).squeeze(-1)
-        if ctx_logits is not None:
-            logits = logits + ctx_logits
+        logits = self.context_logit_head.apply_to_logits(logits, ctx_logits)
         p = torch.sigmoid(logits)
         return p

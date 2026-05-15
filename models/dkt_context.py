@@ -14,10 +14,13 @@ class DKTContext(Module):
         hidden_size,
         ctx_dim,
         dropout=0.1,
-        fusion_type="gate",
+        fusion_type="residual_gate",
         ctx_encoder_dim=256,
         ctx_group_dims=None,
         ctx_logit_hidden_dim=128,
+        ctx_logit_mode="scaled",
+        ctx_logit_init=-3.0,
+        gate_bias_init=-2.0,
     ):
         super().__init__()
         self.num_q = num_q
@@ -35,8 +38,15 @@ class DKTContext(Module):
             dropout=dropout,
             ctx_encoder_dim=ctx_encoder_dim,
             ctx_group_dims=ctx_group_dims,
+            gate_bias_init=gate_bias_init,
         )
-        self.context_logit_head = ContextLogitHead(self.context_fusion.ctx_encoder_dim, ctx_logit_hidden_dim, dropout=dropout)
+        self.context_logit_head = ContextLogitHead(
+            self.context_fusion.ctx_encoder_dim,
+            ctx_logit_hidden_dim,
+            dropout=dropout,
+            ctx_logit_mode=ctx_logit_mode,
+            ctx_logit_init=ctx_logit_init,
+        )
         self.dropout_layer = Dropout(dropout)
         self.out_layer = Linear(self.hidden_size, self.num_q)
 
@@ -54,7 +64,6 @@ class DKTContext(Module):
         target_weight = embedding(qry.long(), self.out_layer.weight)
         target_bias = embedding(qry.long(), self.out_layer.bias.unsqueeze(-1)).squeeze(-1)
         logits = (h * target_weight).sum(-1) + target_bias
-        if ctx_logits is not None:
-            logits = logits + ctx_logits
+        logits = self.context_logit_head.apply_to_logits(logits, ctx_logits)
         p = torch.sigmoid(logits)
         return p

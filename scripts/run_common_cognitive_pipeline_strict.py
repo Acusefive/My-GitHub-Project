@@ -13,6 +13,7 @@ from common_pipeline_strict.constants import (
     TEXT_EMBED_MAX_LENGTH,
     TEXT_EMBED_MODEL_NAME,
     TEXT_RERANK_BATCH_SIZE,
+    TEXT_RERANK_MAX_LENGTH,
     TEXT_RERANK_MODEL_NAME,
     TRAIN_SEED,
     USE_QWEN_RERANKER,
@@ -32,16 +33,21 @@ def main() -> None:
     parser.add_argument("--preview_limit", type=int, default=50)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--skip_stage32", action="store_true")
+    parser.add_argument("--stop_after_stage32", action="store_true")
     parser.add_argument("--stage32_core_artifacts_only", action="store_true")
     parser.add_argument("--text_embed_model", type=str, default=TEXT_EMBED_MODEL_NAME)
     parser.add_argument("--text_embed_batch_size", type=int, default=TEXT_EMBED_BATCH_SIZE)
     parser.add_argument("--text_embed_max_length", type=int, default=TEXT_EMBED_MAX_LENGTH)
+    parser.add_argument("--semantic_id_source", choices=["auto", "cluster", "concept"], default="auto")
     parser.add_argument("--text_rerank_model", type=str, default=TEXT_RERANK_MODEL_NAME)
     parser.add_argument("--text_rerank_batch_size", type=int, default=TEXT_RERANK_BATCH_SIZE)
+    parser.add_argument("--text_rerank_max_length", type=int, default=TEXT_RERANK_MAX_LENGTH)
     parser.add_argument("--use_qwen_reranker", action="store_true", default=USE_QWEN_RERANKER)
     parser.add_argument("--disable_qwen_reranker", action="store_true")
     parser.add_argument("--rerank_topk", type=int, default=RERANK_TOPK)
     parser.add_argument("--rerank_weight", type=float, default=RERANK_WEIGHT)
+    parser.add_argument("--rerank_cache_scope", choices=["pair_result", "pair", "interaction"], default="pair_result")
+    parser.add_argument("--rerank_cache_warmup_only", action="store_true")
     parser.add_argument("--enable_llm_graph_completion", action="store_true")
     parser.add_argument("--enable_llm_summary", action="store_true")
     parser.add_argument("--reuse_existing_contexts", action="store_true")
@@ -51,8 +57,11 @@ def main() -> None:
     parser.add_argument("--llm_timeout_sec", type=int, default=120)
     parser.add_argument("--llm_max_tokens", type=int, default=160)
     parser.add_argument("--llm_temperature", type=float, default=0.1)
+    parser.add_argument("--llm_disable_thinking", action="store_true")
+    parser.add_argument("--llm_use_chat_template_kwargs", action="store_true")
     parser.add_argument("--llm_summary_workers", type=int, default=LLM_SUMMARY_WORKERS)
     parser.add_argument("--llm_summary_chunk_size", type=int, default=LLM_SUMMARY_CHUNK_SIZE)
+    parser.add_argument("--llm_summary_batch_size", type=int, default=1)
     parser.add_argument("--context_shard_index", type=int, default=0)
     parser.add_argument("--context_num_shards", type=int, default=1)
     parser.add_argument("--merge_context_shards", action="store_true")
@@ -63,6 +72,9 @@ def main() -> None:
     contexts_dir = ensure_dir(out_root / "contexts")
     reports_dir = ensure_dir(out_root / "reports")
     cache_dir = ensure_dir(out_root / "cache")
+
+    if args.stop_after_stage32 and args.skip_stage32:
+        raise ValueError("--stop_after_stage32 cannot be combined with --skip_stage32")
 
     if args.stage32_core_artifacts_only:
         from common_pipeline_strict.stage32 import run_stage32_core_artifacts
@@ -75,6 +87,7 @@ def main() -> None:
             text_embed_model=str(args.text_embed_model),
             text_embed_batch_size=int(args.text_embed_batch_size),
             text_embed_max_length=int(args.text_embed_max_length),
+            semantic_id_source=str(args.semantic_id_source),
         )
         print("[OK] strict stage32 core artifacts finished")
         print("[SEMANTIC_IDS]", result.semantic_ids_path)
@@ -101,6 +114,7 @@ def main() -> None:
             text_embed_model=str(args.text_embed_model),
             text_embed_batch_size=int(args.text_embed_batch_size),
             text_embed_max_length=int(args.text_embed_max_length),
+            semantic_id_source=str(args.semantic_id_source),
             enable_llm_graph_completion=bool(args.enable_llm_graph_completion),
             llm_base_url=str(args.llm_base_url),
             llm_model=str(args.llm_model),
@@ -109,6 +123,14 @@ def main() -> None:
             llm_max_tokens=int(args.llm_max_tokens),
             llm_temperature=float(args.llm_temperature),
         )
+
+    if args.stop_after_stage32:
+        print("[OK] strict stage32 finished")
+        print("[PRIORS]", stage32.manifest_path)
+        if getattr(stage32, "semantic_id_audit_path", None):
+            print("[SEMANTIC_AUDIT]", stage32.semantic_id_audit_path)
+        return
+
     from common_pipeline_strict.stage34 import run_stage34
 
     stage34 = run_stage34(
@@ -126,9 +148,12 @@ def main() -> None:
         text_embed_max_length=int(args.text_embed_max_length),
         text_rerank_model=str(args.text_rerank_model),
         text_rerank_batch_size=int(args.text_rerank_batch_size),
+        text_rerank_max_length=int(args.text_rerank_max_length),
         use_qwen_reranker=bool(args.use_qwen_reranker and not args.disable_qwen_reranker),
         rerank_topk=int(args.rerank_topk),
         rerank_weight=float(args.rerank_weight),
+        rerank_cache_scope=str(args.rerank_cache_scope),
+        rerank_cache_warmup_only=bool(args.rerank_cache_warmup_only),
         enable_llm_summary=bool(args.enable_llm_summary),
         llm_base_url=str(args.llm_base_url),
         llm_model=str(args.llm_model),
@@ -136,8 +161,11 @@ def main() -> None:
         llm_timeout_sec=int(args.llm_timeout_sec),
         llm_max_tokens=int(args.llm_max_tokens),
         llm_temperature=float(args.llm_temperature),
+        llm_disable_thinking=bool(args.llm_disable_thinking),
+        llm_use_chat_template_kwargs=bool(args.llm_use_chat_template_kwargs),
         llm_summary_workers=int(args.llm_summary_workers),
         llm_summary_chunk_size=int(args.llm_summary_chunk_size),
+        llm_summary_batch_size=int(args.llm_summary_batch_size),
         reuse_existing_contexts=bool(args.reuse_existing_contexts),
         context_shard_index=int(args.context_shard_index),
         context_num_shards=int(args.context_num_shards),

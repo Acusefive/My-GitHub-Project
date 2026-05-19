@@ -284,6 +284,86 @@ def _semantic_cluster_text(problem: ProblemRecord) -> str:
     return " ".join(part for part in parts if part).strip()
 
 
+def _split_knowledge_route(location: str) -> List[str]:
+    raw = str(location or "").strip()
+    if not raw:
+        return []
+    if "----" in raw:
+        parts = raw.split("----")
+    elif ">" in raw:
+        parts = raw.split(">")
+    elif "/" in raw:
+        parts = raw.split("/")
+    else:
+        parts = [raw]
+    return [part.strip() for part in parts if _sanitize_semantic_token(part)]
+
+
+def _same_semantic_part(left: str, right: str) -> bool:
+    left_norm = _normalize_semantic_token(left).lower()
+    right_norm = _normalize_semantic_token(right).lower()
+    return bool(left_norm and right_norm and left_norm == right_norm)
+
+
+def _add_semantic_part(parts: List[str], value: str) -> None:
+    cleaned = _sanitize_semantic_token(value)
+    if not cleaned:
+        return
+    if any(_same_semantic_part(cleaned, existing) for existing in parts):
+        return
+    parts.append(cleaned)
+
+
+def _concept_semantic_id(problem: ProblemRecord) -> str:
+    route_parts = _split_knowledge_route(problem.location)
+    concept_parts = [concept for concept in problem.concepts if _sanitize_semantic_token(concept)]
+    parts: List[str] = []
+
+    if len(route_parts) >= 2:
+        _add_semantic_part(parts, route_parts[-2])
+    elif route_parts:
+        _add_semantic_part(parts, route_parts[-1])
+
+    for concept in concept_parts[:2]:
+        _add_semantic_part(parts, concept)
+
+    if len(parts) < 2 and route_parts:
+        _add_semantic_part(parts, route_parts[-1])
+
+    return _join_semantic_id_parts(parts[0], "-".join(parts[1:])) if parts else ""
+
+
+def _build_concept_semantic_ids(
+    problem_records: Sequence[ProblemRecord],
+    *,
+    semantic_ids_path: Path,
+    requested_source: str,
+) -> Tuple[Dict[str, str], List[str], Dict[str, Any]]:
+    semantic_ids: Dict[str, str] = {}
+    semantic_texts: List[str] = []
+    generation_stats: Counter = Counter()
+    generation_stats["problem_count"] = len(problem_records)
+    generation_stats["semantic_id_source_requested"] = requested_source
+    generation_stats["semantic_id_source_effective"] = "concept"
+
+    for problem in problem_records:
+        semantic_id = _concept_semantic_id(problem)
+        if not semantic_id:
+            generation_stats["concept_fallback_count"] += 1
+            semantic_id = _compose_semantic_id_with_stats(
+                problem,
+                _semantic_fallback_token(problem, prefer_chapter=True),
+                _semantic_fallback_token(problem, prefer_chapter=False),
+                generation_stats,
+            )
+        semantic_ids[problem.problem_id] = semantic_id
+        semantic_texts.append(semantic_id)
+
+    write_json(semantic_ids, semantic_ids_path)
+    audit_report = build_semantic_id_audit_report(problem_records, semantic_ids, generation_stats)
+    return semantic_ids, semantic_texts, audit_report
+
+
 def canonicalize_cluster_labels(labels: np.ndarray) -> np.ndarray:
     unique_labels = sorted(int(label) for label in np.unique(labels))
     ordered_groups: List[Tuple[Tuple[int, ...], int]] = []
@@ -463,7 +543,25 @@ def build_semantic_ids(
     text_vectors: np.ndarray,
     *,
     semantic_ids_path: Path,
+    semantic_id_source: str = "auto",
 ) -> Tuple[Dict[str, str], List[str], Dict[str, Any]]:
+    source = str(semantic_id_source or "auto").strip().lower()
+    if source not in {"auto", "cluster", "concept"}:
+        raise ValueError(f"Unsupported semantic_id_source: {semantic_id_source}")
+    concept_coverage = (
+        sum(1 for problem in problem_records if any(_sanitize_semantic_token(concept) for concept in problem.concepts))
+        / float(max(len(problem_records), 1))
+    )
+    effective_source = "concept" if source == "concept" or (source == "auto" and concept_coverage >= 0.8) else "cluster"
+    if effective_source == "concept":
+        semantic_ids, semantic_texts, audit_report = _build_concept_semantic_ids(
+            problem_records,
+            semantic_ids_path=semantic_ids_path,
+            requested_source=source,
+        )
+        audit_report["generation_stats"]["concept_coverage"] = round(float(concept_coverage), 4)
+        return semantic_ids, semantic_texts, audit_report
+
     problem_ids = [problem.problem_id for problem in problem_records]
     texts = [_semantic_cluster_text(problem) for problem in problem_records]
     k1 = min(KGLOBAL, len(problem_ids))
@@ -475,6 +573,9 @@ def build_semantic_ids(
     semantic_texts: List[str] = []
     generation_stats: Counter = Counter()
     generation_stats["problem_count"] = len(problem_records)
+    generation_stats["semantic_id_source_requested"] = source
+    generation_stats["semantic_id_source_effective"] = "cluster"
+    generation_stats["concept_coverage"] = round(float(concept_coverage), 4)
     generation_stats["macro_cluster_count"] = k1
     for cid in tqdm(range(k1), desc="strict semantic ids"):
         idxs = np.where(labels1 == cid)[0]
@@ -1249,6 +1350,7 @@ def run_stage32_core_artifacts(
     text_embed_model: str = TEXT_EMBED_MODEL_NAME,
     text_embed_batch_size: int = TEXT_EMBED_BATCH_SIZE,
     text_embed_max_length: int = TEXT_EMBED_MAX_LENGTH,
+    semantic_id_source: str = "auto",
 ) -> Stage32CoreArtifactsResult:
     ensure_dir(priors_dir)
     problem_records = load_problem_records(
@@ -1282,6 +1384,7 @@ def run_stage32_core_artifacts(
         problem_records,
         hqtext_vectors,
         semantic_ids_path=semantic_ids_path,
+        semantic_id_source=semantic_id_source,
     )
     semantic_id_audit_path = priors_dir / "semantic_id_audit.json"
     write_json(semantic_id_audit, semantic_id_audit_path)
@@ -1325,6 +1428,7 @@ def run_stage32(
     text_embed_model: str = TEXT_EMBED_MODEL_NAME,
     text_embed_batch_size: int = TEXT_EMBED_BATCH_SIZE,
     text_embed_max_length: int = TEXT_EMBED_MAX_LENGTH,
+    semantic_id_source: str = "auto",
     enable_llm_graph_completion: bool = False,
     llm_base_url: str = "",
     llm_model: str = "",
@@ -1362,6 +1466,7 @@ def run_stage32(
         problem_records,
         hqtext_vectors,
         semantic_ids_path=semantic_ids_path,
+        semantic_id_source=semantic_id_source,
     )
     semantic_id_audit_path = priors_dir / "semantic_id_audit.json"
     write_json(semantic_id_audit, semantic_id_audit_path)
@@ -1470,6 +1575,8 @@ def run_stage32(
         "epsilon": EPS,
         "smoke": smoke,
         "semantic_id_cleaning": {
+            "semantic_id_source": str(semantic_id_source or "auto"),
+            "semantic_id_source_effective": semantic_id_audit.get("generation_stats", {}).get("semantic_id_source_effective"),
             "extra_stopword_count": len(SEMANTIC_EXTRA_STOP_WORDS),
             "placeholder_rule": "drop underscore-only and blank-like tokens",
             "duplicate_collapse": True,

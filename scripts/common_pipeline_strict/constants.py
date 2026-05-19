@@ -79,6 +79,7 @@ WEIGHT_STAGE1 = {
     "K": 1.0,
     "pre": 1.0,
     "peer": 1.0,
+    "semantic": 1.0,
     "high": 1.0,
     "graph": 1.0,
     "collab": 1.0,
@@ -88,6 +89,7 @@ WEIGHT_STAGE2 = {
     "K": 1.0,
     "pre": 1.0,
     "peer": 1.0,
+    "semantic": 1.0,
     "high": 1.0,
     "graph": 1.0,
     "collab": 1.0,
@@ -114,15 +116,17 @@ COVERAGE_WEIGHTS = {
 ROLE_THRESHOLDS = {
     "pre": 0.10,
     "peer": 0.10,
+    "semantic": 0.10,
     "high": 0.05,
     "graph": 0.05,
     "collab": 0.10,
 }
 
-ROLE_ORDER = ("pre", "peer", "high", "graph", "collab")
+ROLE_ORDER = ("pre", "peer", "semantic", "high", "graph", "collab")
 ROLE_LABELS = {
     "pre": "前置支撑",
     "peer": "同质迁移",
+    "semantic": "语义近邻",
     "high": "高阶佐证",
     "graph": "图谱补充",
     "collab": "协同补充",
@@ -134,7 +138,7 @@ SUMMARY_TEMPLATE = (
     "当前判断主要依赖 {dominant_role} 证据，整体风险为 {risk_level}。"
 )
 
-QUESTION_TEXT_LIMIT = 80
+QUESTION_TEXT_LIMIT = 200
 QUESTION_TEXT_ELLIPSIS = "…"
 SUPPORT_SCORE_DECIMALS = 4
 

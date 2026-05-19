@@ -78,10 +78,16 @@ def run_validation(
     ]
     ordered_hqtext = [hqtext_map[problem.problem_id] for problem in recompute_problems]
     recomputed_path = reports_dir / "semantic_ids_recomputed.json"
+    semantic_id_source = (
+        defaults.get("semantic_id_cleaning", {}).get("semantic_id_source")
+        if isinstance(defaults.get("semantic_id_cleaning"), dict)
+        else None
+    )
     recomputed_ids, _semantic_texts, recomputed_semantic_audit = build_semantic_ids(
         recompute_problems,
         text_vectors=np.stack(ordered_hqtext, axis=0),
         semantic_ids_path=recomputed_path,
+        semantic_id_source=str(semantic_id_source or "cluster"),
     )
     semantic_ids_stable = recomputed_ids == semantic_ids
     if not semantic_ids_stable:
@@ -349,6 +355,8 @@ def run_validation(
         "context_records_checked": len(contexts),
         "semantic_id_checks": {
             "audit_path": str(semantic_audit_path),
+            "source": semantic_id_source or "cluster",
+            "effective_source": semantic_generation_stats.get("semantic_id_source_effective"),
             "flagged_ratio": semantic_flagged_ratio,
             "flagged_ratio_threshold": semantic_flagged_ratio_threshold,
             "macro_fallback_ratio": macro_fallback_ratio,

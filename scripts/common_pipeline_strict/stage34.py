@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import hashlib
 import json
 import math
 import pickle
+import sqlite3
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -69,6 +69,12 @@ from .llm_utils import (
     parse_llm_summary_json,
     summary_cache_key,
 )
+from .llm_summary_signatures import (
+    LLM_SUMMARY_SIGNATURE_PREFIX,
+    llm_summary_signature_key,
+    summarize_llm_record,
+    summarize_llm_records_batch,
+)
 from .models import load_strict_prior_model
 from .retrieval_models import QwenEmbeddingEncoder, QwenReranker
 
@@ -90,15 +96,20 @@ class Stage34Result:
     text_embed_max_length: int
     text_rerank_model: str
     text_rerank_batch_size: int
+    text_rerank_max_length: int
     use_qwen_reranker: bool
     rerank_topk: int
     rerank_weight: float
+    rerank_cache_scope: str
     reranker_cache_path: Optional[str]
     llm_summary_workers: int
     llm_summary_chunk_size: int
+    llm_summary_batch_size: int
     context_shard_index: int
     context_num_shards: int
     merge_context_shards: bool
+    mode: str = "contexts"
+    warmup_stats: Optional[Dict[str, Any]] = None
 
 
 def _normalize_matrix(matrix: np.ndarray) -> np.ndarray:
@@ -399,11 +410,13 @@ def _candidate_scores(
 
     spre = 0.0
     speer = 0.0
+    ssemantic = 0.0
     shigh = 0.0
+    peer_similarity = 0.0
     if delta_l > 0:
         spre = ki * mi * math.exp(-GAMMA_PRE * abs(delta_l))
     elif delta_l == 0:
-        speer = float(seq_eq_cos[hist_pos, current_t])
+        peer_similarity = float(seq_eq_cos[hist_pos, current_t])
     else:
         shigh = ki * ((BETA_POS * float(seq_results[hist_pos])) - (BETA_NEG * (1.0 - float(seq_results[hist_pos])))) * math.exp(
             -GAMMA_HIGH * abs(delta_l)
@@ -412,6 +425,11 @@ def _candidate_scores(
     graph_bonus = float(seq_cache["graph_bonus"][hist_pos, current_t])
     graw = ki + graph_bonus
     gcomp = max(0.0, graw - ki)
+    if delta_l == 0:
+        if ki > 0.0 or gcomp > 0.0:
+            speer = peer_similarity
+        else:
+            ssemantic = peer_similarity
     explicit_match = _clip01(
         EXPLICIT_MATCH_WEIGHTS["K"] * ki
         + EXPLICIT_MATCH_WEIGHTS["L"] * math.exp(-1.0 * abs(delta_l))
@@ -428,6 +446,7 @@ def _candidate_scores(
         WEIGHT_STAGE1["K"] * ki
         + WEIGHT_STAGE1["pre"] * spre
         + WEIGHT_STAGE1["peer"] * speer
+        + WEIGHT_STAGE1.get("semantic", 1.0) * ssemantic
         + WEIGHT_STAGE1["high"] * shigh
         + WEIGHT_STAGE1["graph"] * gcomp
         + WEIGHT_STAGE1["collab"] * scollab
@@ -437,6 +456,7 @@ def _candidate_scores(
         WEIGHT_STAGE2["K"] * ki
         + WEIGHT_STAGE2["pre"] * spre
         + WEIGHT_STAGE2["peer"] * speer
+        + WEIGHT_STAGE2.get("semantic", 1.0) * ssemantic
         + WEIGHT_STAGE2["high"] * shigh
         + WEIGHT_STAGE2["graph"] * gcomp
         + WEIGHT_STAGE2["collab"] * scollab
@@ -445,6 +465,7 @@ def _candidate_scores(
     activation = {
         "pre": int(spre > ROLE_THRESHOLDS["pre"]),
         "peer": int(speer > ROLE_THRESHOLDS["peer"]),
+        "semantic": int(ssemantic > ROLE_THRESHOLDS.get("semantic", ROLE_THRESHOLDS["peer"])),
         "high": int(shigh > ROLE_THRESHOLDS["high"]),
         "graph": int(gcomp > ROLE_THRESHOLDS["graph"]),
         "collab": int(scollab > ROLE_THRESHOLDS["collab"]),
@@ -456,6 +477,7 @@ def _candidate_scores(
         "raw_scores": {
             "pre": float(spre),
             "peer": float(speer),
+            "semantic": float(ssemantic),
             "high": float(shigh),
             "graph": float(gcomp),
             "collab": float(scollab),
@@ -607,70 +629,6 @@ def _summary_fields(
 def _build_llm_context_text(llm_summary_text: str, main_context_text: str) -> str:
     parsed = parse_llm_summary_json(str(llm_summary_text or ""))
     parts: List[str] = []
-    if parsed["summary"]:
-        parts.append(parsed["summary"])
-    if parsed["stable_points"]:
-        parts.append("稳定掌握点:" + "；".join(parsed["stable_points"]))
-    if parsed["weak_points"]:
-        parts.append("持续薄弱点:" + "；".join(parsed["weak_points"]))
-    parts.append(f"近期波动性:{parsed['volatility']}")
-    parts.append(f"摘要置信度:{parsed['confidence']}")
-    summary = " ".join(part.strip() for part in parts if part.strip())
-    main = str(main_context_text or "").strip()
-    if summary and main:
-        return summary + "\n" + main
-    return summary or main
-
-
-def _build_llm_struct_texts(record: Dict[str, Any]) -> Dict[str, str]:
-    llm_summary_text = str(record.get("summary_fields", {}).get("llm_summary_text") or "").strip()
-    parsed = parse_llm_summary_json(llm_summary_text)
-    stable_text = "；".join(parsed["stable_points"])
-    weak_text = "；".join(parsed["weak_points"])
-    summary_text = parsed["summary"]
-    volatility = parsed["volatility"]
-    confidence = parsed["confidence"]
-    aux_text = f"波动性:{volatility} 置信度:{confidence}"
-    return {
-        "stable_text": stable_text,
-        "weak_text": weak_text,
-        "summary_text": summary_text,
-        "aux_text": aux_text,
-    }
-
-
-def _build_llm_struct_feature_vector(record: Dict[str, Any]) -> np.ndarray:
-    llm_summary_text = str(record.get("summary_fields", {}).get("llm_summary_text") or "").strip()
-    parsed = parse_llm_summary_json(llm_summary_text)
-    stable_points = [str(item).strip() for item in parsed["stable_points"] if str(item).strip()]
-    weak_points = [str(item).strip() for item in parsed["weak_points"] if str(item).strip()]
-    summary = str(parsed["summary"]).strip()
-
-    volatility = str(parsed["volatility"])
-    confidence = str(parsed["confidence"])
-    levels = ("低", "中", "高")
-
-    volatility_onehot = [1.0 if volatility == level else 0.0 for level in levels]
-    confidence_onehot = [1.0 if confidence == level else 0.0 for level in levels]
-
-    features = np.asarray(
-        [
-            float(len(stable_points)) / 2.0,
-            float(len(weak_points)) / 2.0,
-            1.0 if stable_points else 0.0,
-            1.0 if weak_points else 0.0,
-            min(float(len(summary)), 60.0) / 60.0,
-            *volatility_onehot,
-            *confidence_onehot,
-        ],
-        dtype=np.float32,
-    )
-    return features
-
-
-def _build_llm_context_text(llm_summary_text: str, main_context_text: str) -> str:
-    parsed = parse_llm_summary_json(str(llm_summary_text or ""))
-    parts: List[str] = []
     diagnosis = str(parsed.get("diagnosis") or "").strip()
     if diagnosis:
         parts.append(diagnosis)
@@ -790,6 +748,18 @@ def _load_index_records_from_contexts(contexts_path: Path) -> Tuple[List[Dict[st
             )
             record_count += 1
     return index_records, record_count
+
+
+def _context_record_count_hint(manifest_path: Path, contexts_path: Path) -> Optional[int]:
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            record_count = int(manifest.get("record_count") or 0)
+            if record_count > 0:
+                return record_count
+        except Exception:
+            pass
+    return None
 
 
 def _shard_suffix(shard_index: int, shard_count: int) -> str:
@@ -990,70 +960,70 @@ def _enrich_contexts_with_llm_summary(
     summarizer: OpenAICompatibleSummarizer,
     llm_summary_workers: int,
     llm_summary_chunk_size: int,
+    llm_summary_batch_size: int,
+    total_records_hint: Optional[int] = None,
 ) -> None:
     ensure_dir(cache_dir)
-
-    def _summary_signature_key(record: Dict[str, Any]) -> str:
-        """Semantic cache key for LLM summaries across repeated context shapes."""
-        summary_fields = record.get("summary_fields") or {}
-        evidence_signature: List[Dict[str, Any]] = []
-        for evidence in record.get("evidence_list") or []:
-            evidence_signature.append(
-                {
-                    "semantic_id": str(evidence.get("semantic_id") or ""),
-                    "role": str(evidence.get("role") or ""),
-                    "knowledge_overlap": str(evidence.get("knowledge_overlap") or ""),
-                    "level_diff": int(evidence.get("level_diff") or 0),
-                    "answer_result": str(evidence.get("answer_result") or ""),
-                    "support_band": round(float(evidence.get("support_score") or 0.0), 1),
-                }
-            )
-        payload = {
-            "target_semantic_id": str(record.get("target_semantic_id") or ""),
-            "target_concepts": [str(item) for item in summary_fields.get("target_concepts") or []],
-            "dominant_role": str(summary_fields.get("dominant_role") or ""),
-            "risk_level": str(summary_fields.get("risk_level") or ""),
-            "recent_trend": str(summary_fields.get("recent_trend") or ""),
-            "evidence": evidence_signature,
-        }
-        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
-        return f"semantic-signature\t{digest}"
+    cache_prefix = LLM_SUMMARY_SIGNATURE_PREFIX
 
     def _summarize_record(record: Dict[str, Any]) -> str:
-        target_pid = str(record["target_pid"])
-        target_meta = problem_catalog_records[target_pid]
-        return summarizer.summarize(
-            target_pid=target_pid,
-            target_question_text=str(target_meta["text"]),
-            target_semantic_id=str(record.get("target_semantic_id") or target_meta["semantic_id"]),
-            target_concepts=record.get("summary_fields", {}).get("target_concepts") or target_meta["concepts"],
-            evidence_list=record.get("evidence_list") or [],
-            template_summary_text=str(record.get("summary_fields", {}).get("summary_text") or ""),
+        return summarize_llm_record(
+            record=record,
+            problem_catalog_records=problem_catalog_records,
+            summarizer=summarizer,
         )
 
     llm_cache_path = cache_dir / "llm_summary_cache.jsonl"
     llm_failure_path = cache_dir / "llm_summary_failures.jsonl"
-    llm_cache = load_summary_cache(llm_cache_path)
+    raw_llm_cache = load_summary_cache(llm_cache_path)
+    llm_cache = {
+        key: value
+        for key, value in raw_llm_cache.items()
+        if str(key).startswith(cache_prefix)
+    }
     temp_path = contexts_path.with_suffix(".llm.tmp")
     workers = max(1, int(llm_summary_workers))
     chunk_size = max(workers, int(llm_summary_chunk_size))
-    total_records = 0
-    with contexts_path.open("r", encoding="utf-8", errors="replace") as probe_f:
-        for line in probe_f:
-            if line.strip():
-                total_records += 1
+    batch_size = max(1, int(llm_summary_batch_size))
+    total_records = int(total_records_hint or 0)
+    if total_records <= 0:
+        with contexts_path.open("r", encoding="utf-8", errors="replace") as probe_f:
+            for line in probe_f:
+                if line.strip():
+                    total_records += 1
+    print(
+        f"[stage34] llm summary start total_records={total_records} "
+        f"workers={workers} chunk_size={chunk_size} batch_size={batch_size} "
+        f"cache_scope=prompt-signature "
+        f"semantic_cache_entries={len(llm_cache)} raw_cache_entries={len(raw_llm_cache)}",
+        flush=True,
+    )
 
     failures: List[Dict[str, Any]] = []
+    runtime_stats: Dict[str, int] = {
+        "records": 0,
+        "signature_cache_hit_records": 0,
+        "legacy_cache_hit_records": 0,
+        "existing_context_hit_records": 0,
+        "llm_request_count": 0,
+        "llm_summary_records_requested": 0,
+        "llm_batch_fallback_count": 0,
+        "same_chunk_duplicate_records": 0,
+        "new_signature_cache_entries": 0,
+        "failure_count": 0,
+    }
 
     def _rewrite_summary_cache() -> None:
         temp_cache_path = llm_cache_path.with_suffix(".rewrite.tmp")
         with temp_cache_path.open("w", encoding="utf-8") as f:
             for key, summary_text in llm_cache.items():
+                if not str(key).startswith(cache_prefix):
+                    continue
                 f.write(json.dumps({"key": key, "summary_text": summary_text}, ensure_ascii=False) + "\n")
         temp_cache_path.replace(llm_cache_path)
 
     def _record_failure(record: Dict[str, Any], *, key: str, exc: Exception) -> None:
+        runtime_stats["failure_count"] += 1
         failures.append(
             {
                 "key": key,
@@ -1071,23 +1041,49 @@ def _enrich_contexts_with_llm_summary(
         missing_items: List[Tuple[int, str, Dict[str, Any]]] = []
         new_cache_entries: List[Tuple[str, str]] = []
         for idx, record in enumerate(chunk_records):
+            runtime_stats["records"] += 1
             key = summary_cache_key(record["user_id"], int(record["target_t"]), record["target_pid"])
-            signature_key = _summary_signature_key(record)
-            llm_summary_text = (llm_cache.get(key, "") or llm_cache.get(signature_key, "")).strip()
+            signature_key = llm_summary_signature_key(
+                record=record,
+                problem_catalog_records=problem_catalog_records,
+                summarizer=summarizer,
+            )
+            signature_summary_text = str(llm_cache.get(signature_key, "") or "").strip()
+            legacy_summary_text = str(raw_llm_cache.get(key, "") or "").strip()
+            existing_summary_text = str(record.get("summary_fields", {}).get("llm_summary_text") or "").strip()
+            existing_llm_context_text = str(record.get("llm_context_text") or "").strip()
+            cache_candidates = [
+                ("signature", signature_summary_text),
+                ("legacy", legacy_summary_text),
+                ("context", existing_summary_text if existing_llm_context_text else ""),
+            ]
             record["_llm_key"] = key
             record["_llm_signature_key"] = signature_key
-            if llm_summary_text:
+            llm_summary_text = ""
+            cache_source = ""
+            for candidate_source, candidate_text in cache_candidates:
+                candidate_text = str(candidate_text or "").strip()
+                if not candidate_text:
+                    continue
                 try:
-                    parse_llm_summary_json(llm_summary_text)
+                    parse_llm_summary_json(candidate_text)
                 except Exception:
-                    llm_cache.pop(key, None)
-                    llm_cache.pop(signature_key, None)
-                    llm_summary_text = ""
+                    if candidate_source == "signature":
+                        llm_cache.pop(signature_key, None)
+                    elif candidate_source == "legacy":
+                        raw_llm_cache.pop(key, None)
+                    continue
+                llm_summary_text = candidate_text
+                cache_source = candidate_source
+                break
             if llm_summary_text:
                 record["_llm_summary_text"] = llm_summary_text
-                if key not in llm_cache:
-                    llm_cache[key] = llm_summary_text
-                    new_cache_entries.append((key, llm_summary_text))
+                if cache_source == "signature":
+                    runtime_stats["signature_cache_hit_records"] += 1
+                elif cache_source == "legacy":
+                    runtime_stats["legacy_cache_hit_records"] += 1
+                elif cache_source == "context":
+                    runtime_stats["existing_context_hit_records"] += 1
                 if signature_key and signature_key not in llm_cache:
                     llm_cache[signature_key] = llm_summary_text
                     new_cache_entries.append((signature_key, llm_summary_text))
@@ -1104,54 +1100,101 @@ def _enrich_contexts_with_llm_summary(
                 else:
                     signature_owner[signature_key] = (idx, key, record)
             unique_missing_items = list(signature_owner.values())
-            if executor is None or len(missing_items) == 1:
-                for idx, key, record in unique_missing_items:
-                    try:
-                        llm_summary_text = _summarize_record(record)
-                    except Exception as exc:
+            runtime_stats["llm_summary_records_requested"] += len(unique_missing_items)
+            runtime_stats["same_chunk_duplicate_records"] += len(duplicate_items)
+
+            def _summarize_item_batch(
+                batch_items: List[Tuple[int, str, Dict[str, Any]]]
+            ) -> Tuple[List[Tuple[int, str, Dict[str, Any], str]], int, int, List[Tuple[str, Dict[str, Any], Exception]]]:
+                if not batch_items:
+                    return [], 0, 0, []
+                if batch_size <= 1 or len(batch_items) == 1:
+                    results: List[Tuple[int, str, Dict[str, Any], str]] = []
+                    failures_local: List[Tuple[str, Dict[str, Any], Exception]] = []
+                    for idx, key, record in batch_items:
+                        try:
+                            results.append((idx, key, record, _summarize_record(record)))
+                        except Exception as exc:
+                            failures_local.append((key, record, exc))
+                    return results, len(batch_items), 0, failures_local
+
+                record_items = [
+                    (f"case_{pos}", record)
+                    for pos, (_idx, _key, record) in enumerate(batch_items)
+                ]
+                try:
+                    batch_summaries = summarize_llm_records_batch(
+                        record_items=record_items,
+                        problem_catalog_records=problem_catalog_records,
+                        summarizer=summarizer,
+                    )
+                    results = []
+                    for pos, (idx, key, record) in enumerate(batch_items):
+                        results.append((idx, key, record, batch_summaries[f"case_{pos}"]))
+                    return results, 1, 0, []
+                except Exception:
+                    results = []
+                    failures_local = []
+                    for idx, key, record in batch_items:
+                        try:
+                            results.append((idx, key, record, _summarize_record(record)))
+                        except Exception as exc:
+                            failures_local.append((key, record, exc))
+                    return results, 1 + len(batch_items), 1, failures_local
+
+            item_batches = [
+                unique_missing_items[start : start + batch_size]
+                for start in range(0, len(unique_missing_items), batch_size)
+            ]
+            if executor is None or len(item_batches) == 1:
+                for item_batch in item_batches:
+                    results, request_count, fallback_count, batch_failures = _summarize_item_batch(item_batch)
+                    runtime_stats["llm_request_count"] += request_count
+                    runtime_stats["llm_batch_fallback_count"] += fallback_count
+                    for key, record, exc in batch_failures:
                         _record_failure(record, key=key, exc=exc)
-                        continue
-                    signature_key = str(record.get("_llm_signature_key") or "")
-                    record["_llm_summary_text"] = llm_summary_text
-                    llm_cache[key] = llm_summary_text
-                    new_cache_entries.append((key, llm_summary_text))
-                    if signature_key and signature_key not in llm_cache:
-                        llm_cache[signature_key] = llm_summary_text
-                        new_cache_entries.append((signature_key, llm_summary_text))
+                    for idx, key, record, llm_summary_text in results:
+                        signature_key = str(record.get("_llm_signature_key") or "")
+                        record["_llm_summary_text"] = llm_summary_text
+                        if signature_key and signature_key not in llm_cache:
+                            llm_cache[signature_key] = llm_summary_text
+                            new_cache_entries.append((signature_key, llm_summary_text))
             else:
                 future_map = {
-                    executor.submit(_summarize_record, record): (idx, key, record)
-                    for idx, key, record in unique_missing_items
+                    executor.submit(_summarize_item_batch, item_batch): item_batch
+                    for item_batch in item_batches
                 }
                 for future in as_completed(future_map):
-                    idx, key, record = future_map[future]
                     try:
-                        llm_summary_text = future.result()
+                        results, request_count, fallback_count, batch_failures = future.result()
                     except Exception as exc:
-                        _record_failure(record, key=key, exc=exc)
+                        for _idx, key, record in future_map[future]:
+                            _record_failure(record, key=key, exc=exc)
                         continue
-                    signature_key = str(record.get("_llm_signature_key") or "")
-                    record["_llm_summary_text"] = llm_summary_text
-                    llm_cache[key] = llm_summary_text
-                    new_cache_entries.append((key, llm_summary_text))
-                    if signature_key and signature_key not in llm_cache:
-                        llm_cache[signature_key] = llm_summary_text
-                        new_cache_entries.append((signature_key, llm_summary_text))
+                    runtime_stats["llm_request_count"] += request_count
+                    runtime_stats["llm_batch_fallback_count"] += fallback_count
+                    for key, record, exc in batch_failures:
+                        _record_failure(record, key=key, exc=exc)
+                    for idx, key, record, llm_summary_text in results:
+                        signature_key = str(record.get("_llm_signature_key") or "")
+                        record["_llm_summary_text"] = llm_summary_text
+                        if signature_key and signature_key not in llm_cache:
+                            llm_cache[signature_key] = llm_summary_text
+                            new_cache_entries.append((signature_key, llm_summary_text))
 
             for _idx, key, signature_key, record in duplicate_items:
                 llm_summary_text = str(llm_cache.get(signature_key, "") or "").strip()
                 if not llm_summary_text:
                     continue
                 record["_llm_summary_text"] = llm_summary_text
-                llm_cache[key] = llm_summary_text
-                new_cache_entries.append((key, llm_summary_text))
 
         if new_cache_entries:
+            runtime_stats["new_signature_cache_entries"] += len(new_cache_entries)
             append_summary_cache_entries(llm_cache_path, new_cache_entries)
 
         for record in chunk_records:
             key = str(record.pop("_llm_key"))
-            record.pop("_llm_signature_key", None)
+            signature_key = str(record.pop("_llm_signature_key", "") or "")
             llm_summary_text = str(record.pop("_llm_summary_text", "") or "")
             if not llm_summary_text:
                 dst.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -1160,7 +1203,8 @@ def _enrich_contexts_with_llm_summary(
             try:
                 record["summary_fields"]["llm_summary_struct"] = parse_llm_summary_json(llm_summary_text)
             except Exception as exc:
-                llm_cache.pop(key, None)
+                if signature_key:
+                    llm_cache.pop(signature_key, None)
                 _record_failure(record, key=key, exc=exc)
                 record["summary_fields"].pop("llm_summary_text", None)
                 record["summary_fields"].pop("llm_summary_struct", None)
@@ -1199,6 +1243,11 @@ def _enrich_contexts_with_llm_summary(
     contexts_path.unlink(missing_ok=True)
     temp_path.replace(contexts_path)
     _rewrite_summary_cache()
+    print(
+        "[stage34] llm summary runtime stats "
+        + json.dumps(runtime_stats, ensure_ascii=False, sort_keys=True),
+        flush=True,
+    )
     if failures:
         with llm_failure_path.open("w", encoding="utf-8") as f:
             for item in failures:
@@ -1210,8 +1259,61 @@ def _enrich_contexts_with_llm_summary(
     llm_failure_path.unlink(missing_ok=True)
 
 
-def _reranker_score_cache_key(user_id: str, target_t: int, target_pid: str, hist_pid: str) -> str:
-    return f"{user_id}\t{int(target_t)}\t{target_pid}\t{hist_pid}"
+def _reranker_score_cache_key(
+    *,
+    cache_scope: str,
+    user_id: str,
+    target_t: int,
+    target_pid: str,
+    hist_pid: str,
+    answer_result: str = "",
+) -> str:
+    scope = str(cache_scope or "pair_result").strip().lower()
+    if scope == "pair":
+        return f"pair\t{target_pid}\t{hist_pid}"
+    if scope == "pair_result":
+        return f"pair_result\t{target_pid}\t{hist_pid}\t{str(answer_result or '').strip()}"
+    if scope == "interaction":
+        return f"interaction\t{user_id}\t{int(target_t)}\t{target_pid}\t{hist_pid}"
+    raise ValueError(f"Unsupported rerank_cache_scope: {cache_scope}")
+
+
+def _safe_cache_token(value: str) -> str:
+    token = "".join(ch if ch.isalnum() else "_" for ch in str(value or ""))
+    token = "_".join(part for part in token.split("_") if part)
+    return token[-80:] or "default"
+
+
+def _reranker_cache_stem(*, model_name_or_path: str, cache_scope: str, max_length: int) -> str:
+    model_token = _safe_cache_token(Path(str(model_name_or_path or "reranker")).name)
+    return f"reranker_cache.{str(cache_scope)}.{model_token}.max{int(max_length)}"
+
+
+def _reranker_query_text(target_meta: Dict[str, Any]) -> str:
+    return (
+        f"目标题目: {str(target_meta.get('text') or '').strip()}\n"
+        f"目标知识点: {'、'.join(str(item) for item in target_meta.get('concepts') or [])}\n"
+        f"目标语义ID: {str(target_meta.get('semantic_id') or '').strip()}"
+    )
+
+
+def _reranker_doc_text(
+    *,
+    hist_meta: Dict[str, Any],
+    level_diff: int,
+    answer_result: str,
+    overlap_concepts: Sequence[str],
+    include_answer_result: bool,
+) -> str:
+    doc_parts = [
+        f"历史题目: {str(hist_meta.get('text') or '').strip()}",
+        f"知识点: {'、'.join(str(item) for item in hist_meta.get('concepts') or [])}",
+        f"层级差: {int(level_diff)}",
+        f"知识重合: {'、'.join(str(item) for item in overlap_concepts) or '无'}",
+    ]
+    if include_answer_result:
+        doc_parts.append(f"历史结果: {str(answer_result or '').strip()}")
+    return "\n".join(doc_parts)
 
 
 def _append_reranker_cache_entries(cache_path: Path, entries: List[Tuple[str, float]]) -> None:
@@ -1235,33 +1337,40 @@ def _apply_qwen_reranker(
     rerank_cache: Dict[str, Dict[str, Any]],
     reranker_cache_path: Path,
     rerank_weight: float,
+    rerank_cache_scope: str,
 ) -> None:
     if not stage1_candidates:
         return
-    query = (
-        f"目标题目: {str(target_meta.get('text') or '').strip()}\n"
-        f"目标知识点: {'、'.join(str(item) for item in target_meta.get('concepts') or [])}\n"
-        f"目标语义ID: {str(target_meta.get('semantic_id') or '').strip()}"
-    )
+    query = _reranker_query_text(target_meta)
     instruction = "Judge whether the historical problem is semantically useful evidence for predicting the target educational problem."
     docs: List[str] = []
     missing_indices: List[int] = []
     missing_keys: List[str] = []
     new_cache_entries: List[Tuple[str, float]] = []
+    cache_scope = str(rerank_cache_scope or "pair_result").strip().lower()
     for idx, candidate in enumerate(stage1_candidates):
         hist_pid = str(candidate["problem_id"])
-        cache_key = _reranker_score_cache_key(user_id, target_t, target_pid, hist_pid)
+        cache_key = _reranker_score_cache_key(
+            cache_scope=cache_scope,
+            user_id=user_id,
+            target_t=target_t,
+            target_pid=target_pid,
+            hist_pid=hist_pid,
+            answer_result=str(candidate.get("answer_result") or ""),
+        )
         payload = rerank_cache.get(cache_key)
         if payload is not None:
             candidate["raw_scores"]["rerank"] = float(payload["score"])
             continue
         hist_meta = problem_catalog_records[hist_pid]
         docs.append(
-            f"历史题目: {str(hist_meta.get('text') or '').strip()}\n"
-            f"知识点: {'、'.join(str(item) for item in hist_meta.get('concepts') or [])}\n"
-            f"层级差: {candidate['level_diff']}\n"
-            f"历史结果: {candidate['answer_result']}\n"
-            f"知识重合: {'、'.join(candidate.get('knowledge_overlap_concepts') or []) or '无'}"
+            _reranker_doc_text(
+                hist_meta=hist_meta,
+                level_diff=int(candidate["level_diff"]),
+                answer_result=str(candidate["answer_result"]),
+                overlap_concepts=candidate.get("knowledge_overlap_concepts") or [],
+                include_answer_result=cache_scope in {"pair_result", "interaction"},
+            )
         )
         missing_indices.append(idx)
         missing_keys.append(cache_key)
@@ -1280,6 +1389,293 @@ def _apply_qwen_reranker(
     for candidate in stage1_candidates:
         rerank_score = float(candidate["raw_scores"].get("rerank", 0.0))
         candidate["Ui"] = float(candidate["Ui"]) + float(rerank_weight) * rerank_score
+
+
+def _flush_rerank_job_rows(conn: sqlite3.Connection, rows: List[Tuple[str, str, str, str, int, str]]) -> int:
+    if not rows:
+        return 0
+    cursor = conn.executemany(
+        """
+        INSERT OR IGNORE INTO rerank_jobs
+        (cache_key, target_pid, hist_pid, answer_result, level_diff, overlap_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    conn.commit()
+    inserted = int(cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else 0)
+    rows.clear()
+    return inserted
+
+
+def _score_rerank_job_rows(
+    *,
+    rows: List[Tuple[str, str, str, str, int, str]],
+    problem_catalog_records: Dict[str, Dict[str, Any]],
+    reranker: QwenReranker,
+    reranker_cache_path: Path,
+    rerank_cache_scope: str,
+) -> int:
+    if not rows:
+        return 0
+    target_pid = rows[0][1]
+    query = _reranker_query_text(problem_catalog_records[target_pid])
+    include_answer_result = rerank_cache_scope in {"pair_result", "interaction"}
+    docs: List[str] = []
+    keys: List[str] = []
+    for cache_key, _target_pid, hist_pid, answer_result, level_diff, overlap_json in rows:
+        try:
+            overlap_concepts = json.loads(overlap_json)
+        except Exception:
+            overlap_concepts = []
+        docs.append(
+            _reranker_doc_text(
+                hist_meta=problem_catalog_records[hist_pid],
+                level_diff=int(level_diff),
+                answer_result=str(answer_result),
+                overlap_concepts=overlap_concepts,
+                include_answer_result=include_answer_result,
+            )
+        )
+        keys.append(cache_key)
+    instruction = "Judge whether the historical problem is semantically useful evidence for predicting the target educational problem."
+    scores = reranker.score(query=query, docs=docs, instruction=instruction)
+    if len(scores) != len(keys):
+        raise ValueError("Reranker returned inconsistent score count during cache warmup")
+    _append_reranker_cache_entries(reranker_cache_path, list(zip(keys, scores)))
+    return len(keys)
+
+
+def _precompute_reranker_cache(
+    *,
+    problem_json: Path,
+    student_json: Path,
+    priors_dir: Path,
+    cache_dir: Path,
+    problem_catalog_records: Dict[str, Dict[str, Any]],
+    device: str,
+    reranker: QwenReranker,
+    reranker_cache_path: Path,
+    rerank_cache_scope: str,
+    rerank_topk: int,
+    smoke: bool,
+    context_shard_index: int,
+    context_num_shards: int,
+) -> Dict[str, Any]:
+    if rerank_cache_scope == "interaction":
+        raise ValueError("Rerank cache warmup is only useful for pair_result or pair scope, not interaction scope")
+
+    existing_cache = load_json_cache(reranker_cache_path)
+    job_suffix = (
+        f"{rerank_cache_scope}.{_shard_suffix(context_shard_index, context_num_shards)}"
+        if context_num_shards > 1
+        else rerank_cache_scope
+    )
+    job_db_path = cache_dir / f"reranker_jobs.{job_suffix}.sqlite"
+    conn = sqlite3.connect(str(job_db_path))
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rerank_jobs (
+            cache_key TEXT PRIMARY KEY,
+            target_pid TEXT NOT NULL,
+            hist_pid TEXT NOT NULL,
+            answer_result TEXT NOT NULL,
+            level_diff INTEGER NOT NULL,
+            overlap_json TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rerank_jobs_target ON rerank_jobs(target_pid)")
+    conn.commit()
+    if existing_cache:
+        existing_keys = list(existing_cache.keys())
+        for start in range(0, len(existing_keys), 5000):
+            conn.executemany(
+                "DELETE FROM rerank_jobs WHERE cache_key = ?",
+                [(key,) for key in existing_keys[start : start + 5000]],
+            )
+        conn.commit()
+
+    problem_records = load_problem_records(problem_json)
+    student_sequences = load_student_sequences(student_json)
+    if smoke:
+        allowed_problem_ids = set(problem_catalog_records.keys())
+        problem_records = [problem for problem in problem_records if problem.problem_id in allowed_problem_ids]
+        student_sequences = student_sequences[:128]
+    if context_num_shards > 1:
+        student_sequences = [
+            student for idx, student in enumerate(student_sequences) if idx % context_num_shards == context_shard_index
+        ]
+
+    with (priors_dir / "semantic_vectors.pkl").open("rb") as f:
+        eqsem_map = pickle.load(f)
+    with (priors_dir / "item_collaborative_embeddings.pkl").open("rb") as f:
+        collab_map = pickle.load(f)
+    collab_neighbors_path = priors_dir / "item_collaborative.json"
+    collab_neighbors = (
+        json.loads(collab_neighbors_path.read_text(encoding="utf-8"))
+        if collab_neighbors_path.exists()
+        else {}
+    )
+    graph_bundle = json.loads((priors_dir / "concept_graph_bundle.json").read_text(encoding="utf-8"))
+    graph_accessor = GraphAccessor(graph_bundle)
+    model = load_strict_prior_model(str(priors_dir / "model_state.pt"), map_location=device).to(device)
+    model.eval()
+
+    pid_lookup = list(problem_catalog_records.keys())
+    pid_to_idx = {pid: idx for idx, pid in enumerate(pid_lookup)}
+    eqsem = np.stack([eqsem_map[pid] for pid in pid_lookup], axis=0).astype(np.float32)
+    eqsem_norm = _normalize_matrix(eqsem)
+    collab_norm: Dict[int, np.ndarray] = {}
+    for pid, vector in collab_map.items():
+        if pid in pid_to_idx:
+            value = np.asarray(vector, dtype=np.float32)
+            norm = float(np.linalg.norm(value))
+            collab_norm[pid_to_idx[pid]] = (value / norm).astype(np.float32) if norm > 0 else value
+
+    pending_rows: List[Tuple[str, str, str, str, int, str]] = []
+    inserted_total = 0
+    seen_in_run: set[str] = set()
+    for student in tqdm(student_sequences, desc="strict rerank cache collect"):
+        seq_pids = [str(log.get("problem_id") or "") for log in student.seq if str(log.get("problem_id") or "") in pid_to_idx]
+        seq_results = [int(log.get("is_correct") or 0) for log in student.seq if str(log.get("problem_id") or "") in pid_to_idx]
+        seq_levels = [
+            int(problem_catalog_records[str(log.get("problem_id"))]["cognitive_dimension"])
+            for log in student.seq
+            if str(log.get("problem_id") or "") in pid_to_idx
+        ]
+        seq_problem_indices = [pid_to_idx[pid] for pid in seq_pids]
+        if len(seq_problem_indices) < 2:
+            continue
+        seq_cache = _build_sequence_cache(
+            seq_problem_indices,
+            seq_levels,
+            pid_lookup,
+            eqsem_norm,
+            collab_norm,
+            collab_neighbors,
+            graph_accessor,
+            problem_catalog_records,
+        )
+        for target_t in range(1, len(seq_problem_indices)):
+            target_pid = pid_lookup[seq_problem_indices[target_t]]
+            _z, d_vec, _sdyn = _compute_dynamic_prior(
+                seq_problem_indices,
+                seq_results,
+                seq_levels,
+                target_t,
+                eqsem,
+                eqsem_norm,
+                model,
+                device,
+            )
+            hist_problem_indices = seq_problem_indices[:target_t]
+            hist_diag_probs = _history_diag_probs(hist_problem_indices, eqsem, d_vec, model, device)
+            dtc_values = _dtc_values(seq_problem_indices, target_t, seq_cache["eq_cos"])
+            candidates: List[Dict[str, Any]] = []
+            history_start = max(0, target_t - HISTORY_WINDOW)
+            for hist_pos in range(history_start, target_t):
+                candidates.append(
+                    _candidate_scores(
+                        hist_pos=hist_pos,
+                        current_t=target_t,
+                        seq_problem_indices=seq_problem_indices,
+                        seq_results=seq_results,
+                        seq_levels=seq_levels,
+                        eqsem=eqsem,
+                        problem_catalog=problem_catalog_records,
+                        pid_lookup=pid_lookup,
+                        p_diag=float(hist_diag_probs[hist_pos]),
+                        dtc_value=float(dtc_values[hist_pos]),
+                        seq_cache=seq_cache,
+                    )
+                )
+            candidates.sort(key=lambda item: (item["Ri"], item["history_pos"]), reverse=True)
+            stage1_candidates = candidates[: min(int(rerank_topk), K1_DEFAULT, len(candidates))]
+            for candidate in stage1_candidates:
+                hist_pid = str(candidate["problem_id"])
+                cache_key = _reranker_score_cache_key(
+                    cache_scope=rerank_cache_scope,
+                    user_id=student.user_id,
+                    target_t=target_t,
+                    target_pid=target_pid,
+                    hist_pid=hist_pid,
+                    answer_result=str(candidate.get("answer_result") or ""),
+                )
+                if cache_key in existing_cache or cache_key in seen_in_run:
+                    continue
+                seen_in_run.add(cache_key)
+                pending_rows.append(
+                    (
+                        cache_key,
+                        target_pid,
+                        hist_pid,
+                        str(candidate.get("answer_result") or ""),
+                        int(candidate["level_diff"]),
+                        json.dumps(candidate.get("knowledge_overlap_concepts") or [], ensure_ascii=False),
+                    )
+                )
+                if len(pending_rows) >= 20000:
+                    inserted_total += _flush_rerank_job_rows(conn, pending_rows)
+    inserted_total += _flush_rerank_job_rows(conn, pending_rows)
+
+    total_jobs = int(conn.execute("SELECT COUNT(*) FROM rerank_jobs").fetchone()[0])
+    print(
+        f"[stage34] rerank cache warmup jobs={total_jobs} newly_inserted={inserted_total} "
+        f"existing_cache={len(existing_cache)} db={job_db_path}",
+        flush=True,
+    )
+
+    score_batch_size = max(128, int(reranker.batch_size) * 32)
+    scored_total = 0
+    current_target = ""
+    rows_for_target: List[Tuple[str, str, str, str, int, str]] = []
+
+    def flush_target_rows() -> None:
+        nonlocal scored_total, rows_for_target
+        while rows_for_target:
+            batch = rows_for_target[:score_batch_size]
+            del rows_for_target[:score_batch_size]
+            scored = _score_rerank_job_rows(
+                rows=batch,
+                problem_catalog_records=problem_catalog_records,
+                reranker=reranker,
+                reranker_cache_path=reranker_cache_path,
+                rerank_cache_scope=rerank_cache_scope,
+            )
+            conn.executemany("DELETE FROM rerank_jobs WHERE cache_key = ?", [(row[0],) for row in batch])
+            conn.commit()
+            scored_total += scored
+            progress.update(scored)
+
+    cursor = conn.execute(
+        "SELECT cache_key, target_pid, hist_pid, answer_result, level_diff, overlap_json "
+        "FROM rerank_jobs ORDER BY target_pid"
+    )
+    with tqdm(total=total_jobs, desc="strict rerank cache score") as progress:
+        for row in cursor:
+            row_tuple = (
+                str(row[0]),
+                str(row[1]),
+                str(row[2]),
+                str(row[3]),
+                int(row[4]),
+                str(row[5]),
+            )
+            if current_target and row_tuple[1] != current_target:
+                flush_target_rows()
+            current_target = row_tuple[1]
+            rows_for_target.append(row_tuple)
+        flush_target_rows()
+    conn.close()
+    return {
+        "reranker_cache_path": str(reranker_cache_path),
+        "reranker_job_db_path": str(job_db_path),
+        "existing_cache_entries": len(existing_cache),
+        "job_count": total_jobs,
+        "newly_inserted_jobs": inserted_total,
+        "scored_jobs": scored_total,
+    }
 
 
 def _evidence_record(candidate: Dict[str, Any], rank: int, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -1332,9 +1728,12 @@ def run_stage34(
     text_embed_max_length: int = TEXT_EMBED_MAX_LENGTH,
     text_rerank_model: str = TEXT_RERANK_MODEL_NAME,
     text_rerank_batch_size: int = TEXT_RERANK_BATCH_SIZE,
+    text_rerank_max_length: int = TEXT_RERANK_MAX_LENGTH,
     use_qwen_reranker: bool = USE_QWEN_RERANKER,
     rerank_topk: int = RERANK_TOPK,
     rerank_weight: float = RERANK_WEIGHT,
+    rerank_cache_scope: str = "pair_result",
+    rerank_cache_warmup_only: bool = False,
     enable_llm_summary: bool = False,
     llm_base_url: Optional[str] = None,
     llm_model: Optional[str] = None,
@@ -1342,8 +1741,11 @@ def run_stage34(
     llm_timeout_sec: int = 120,
     llm_max_tokens: int = 160,
     llm_temperature: float = 0.1,
+    llm_disable_thinking: bool = False,
+    llm_use_chat_template_kwargs: bool = False,
     llm_summary_workers: int = LLM_SUMMARY_WORKERS,
     llm_summary_chunk_size: int = LLM_SUMMARY_CHUNK_SIZE,
+    llm_summary_batch_size: int = 1,
     reuse_existing_contexts: bool = False,
     context_shard_index: int = 0,
     context_num_shards: int = 1,
@@ -1365,6 +1767,11 @@ def run_stage34(
     shard_mode = context_num_shards > 1 and not merge_context_shards
     if shard_mode and enable_llm_summary:
         raise ValueError("LLM summary must be run after shard merge; do not pass --enable_llm_summary in shard mode")
+    if rerank_cache_warmup_only and (merge_context_shards or reuse_existing_contexts or enable_llm_summary):
+        raise ValueError("--rerank_cache_warmup_only cannot be combined with merge/reuse/LLM summary modes")
+    rerank_cache_scope = str(rerank_cache_scope or "pair_result").strip().lower()
+    if rerank_cache_scope not in {"pair_result", "pair", "interaction"}:
+        raise ValueError("--rerank_cache_scope must be one of: pair_result, pair, interaction")
 
     problem_catalog_records: Dict[str, Dict[str, Any]] = {}
     with (priors_dir / "problem_catalog.jsonl").open("r", encoding="utf-8") as f:
@@ -1388,9 +1795,11 @@ def run_stage34(
     device = pick_device()
     reranker: Optional[QwenReranker] = None
     reranker_cache_path = (
-        cache_dir / f"reranker_cache.{_shard_suffix(context_shard_index, context_num_shards)}.jsonl"
+        cache_dir
+        / f"{_reranker_cache_stem(model_name_or_path=str(text_rerank_model or TEXT_RERANK_MODEL_NAME), cache_scope=rerank_cache_scope, max_length=int(text_rerank_max_length))}.{_shard_suffix(context_shard_index, context_num_shards)}.jsonl"
         if shard_mode
-        else cache_dir / "reranker_cache.jsonl"
+        else cache_dir
+        / f"{_reranker_cache_stem(model_name_or_path=str(text_rerank_model or TEXT_RERANK_MODEL_NAME), cache_scope=rerank_cache_scope, max_length=int(text_rerank_max_length))}.jsonl"
     )
     rerank_cache: Dict[str, Dict[str, Any]] = {}
     summarizer: Optional[OpenAICompatibleSummarizer] = None
@@ -1398,7 +1807,7 @@ def run_stage34(
         reranker = QwenReranker(
             model_name_or_path=str(text_rerank_model or TEXT_RERANK_MODEL_NAME),
             device=device,
-            max_length=TEXT_RERANK_MAX_LENGTH,
+            max_length=int(text_rerank_max_length),
             batch_size=int(text_rerank_batch_size),
         )
         rerank_cache = load_json_cache(reranker_cache_path)
@@ -1410,7 +1819,57 @@ def run_stage34(
             timeout_sec=int(llm_timeout_sec),
             max_tokens=int(llm_max_tokens),
             temperature=float(llm_temperature),
+            disable_thinking=bool(llm_disable_thinking),
+            use_chat_template_kwargs=bool(llm_use_chat_template_kwargs),
         )
+
+    if rerank_cache_warmup_only:
+        if reranker is None:
+            raise ValueError("--rerank_cache_warmup_only requires Qwen reranker to be enabled")
+        warmup_stats = _precompute_reranker_cache(
+            problem_json=problem_json,
+            student_json=student_json,
+            priors_dir=priors_dir,
+            cache_dir=cache_dir,
+            problem_catalog_records=problem_catalog_records,
+            device=device,
+            reranker=reranker,
+            reranker_cache_path=reranker_cache_path,
+            rerank_cache_scope=rerank_cache_scope,
+            rerank_topk=int(rerank_topk),
+            smoke=bool(smoke),
+            context_shard_index=context_shard_index,
+            context_num_shards=context_num_shards,
+        )
+        manifest_path = cache_dir / f"reranker_cache_warmup.{rerank_cache_scope}.manifest.json"
+        result = Stage34Result(
+            contexts_path=str(contexts_path),
+            preview_path=str(preview_path),
+            embeddings_path=None,
+            manifest_path=str(manifest_path),
+            record_count=int(warmup_stats.get("scored_jobs") or 0),
+            text_embed_model=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
+            text_embed_batch_size=int(text_embed_batch_size),
+            text_embed_max_length=int(text_embed_max_length),
+            text_rerank_model=str(text_rerank_model or TEXT_RERANK_MODEL_NAME),
+            text_rerank_batch_size=int(text_rerank_batch_size),
+            text_rerank_max_length=int(text_rerank_max_length),
+            use_qwen_reranker=bool(use_qwen_reranker),
+            rerank_topk=int(rerank_topk),
+            rerank_weight=float(rerank_weight),
+            rerank_cache_scope=rerank_cache_scope,
+            reranker_cache_path=str(reranker_cache_path.resolve()),
+            llm_summary_workers=int(llm_summary_workers),
+            llm_summary_chunk_size=int(llm_summary_chunk_size),
+            llm_summary_batch_size=int(llm_summary_batch_size),
+            context_shard_index=context_shard_index,
+            context_num_shards=context_num_shards,
+            merge_context_shards=False,
+            mode="rerank_cache_warmup",
+            warmup_stats=warmup_stats,
+        )
+        write_json(asdict(result), Path(result.manifest_path))
+        return result
 
     if merge_context_shards:
         record_count = _merge_context_shards(
@@ -1421,7 +1880,6 @@ def run_stage34(
             output_contexts_path=contexts_path,
             output_preview_path=preview_path,
         )
-        index_records, _ = _load_index_records_from_contexts(contexts_path)
         if summarizer is not None:
             _enrich_contexts_with_llm_summary(
                 contexts_path=contexts_path,
@@ -1430,6 +1888,8 @@ def run_stage34(
                 summarizer=summarizer,
                 llm_summary_workers=int(llm_summary_workers),
                 llm_summary_chunk_size=int(llm_summary_chunk_size),
+                llm_summary_batch_size=int(llm_summary_batch_size),
+                total_records_hint=record_count,
             )
         embeddings_path: Optional[Path] = None
         if not dry_run:
@@ -1452,12 +1912,15 @@ def run_stage34(
             text_embed_max_length=int(text_embed_max_length),
             text_rerank_model=str(text_rerank_model or TEXT_RERANK_MODEL_NAME),
             text_rerank_batch_size=int(text_rerank_batch_size),
+            text_rerank_max_length=int(text_rerank_max_length),
             use_qwen_reranker=bool(use_qwen_reranker),
             rerank_topk=int(rerank_topk),
             rerank_weight=float(rerank_weight),
+            rerank_cache_scope=rerank_cache_scope,
             reranker_cache_path=None,
             llm_summary_workers=int(llm_summary_workers),
             llm_summary_chunk_size=int(llm_summary_chunk_size),
+            llm_summary_batch_size=int(llm_summary_batch_size),
             context_shard_index=context_shard_index,
             context_num_shards=context_num_shards,
             merge_context_shards=True,
@@ -1468,7 +1931,7 @@ def run_stage34(
     if reuse_existing_contexts:
         if not contexts_path.exists():
             raise FileNotFoundError(f"--reuse_existing_contexts was set but {contexts_path} does not exist")
-        index_records, record_count = _load_index_records_from_contexts(contexts_path)
+        record_count = _context_record_count_hint(manifest_path, contexts_path) or 0
     else:
         problem_records = load_problem_records(problem_json)
         student_sequences = load_student_sequences(student_json)
@@ -1582,6 +2045,7 @@ def run_stage34(
                             rerank_cache=rerank_cache,
                             reranker_cache_path=reranker_cache_path,
                             rerank_weight=float(rerank_weight),
+                            rerank_cache_scope=rerank_cache_scope,
                         )
 
                     selected: List[Dict[str, Any]] = []
@@ -1651,6 +2115,8 @@ def run_stage34(
             summarizer=summarizer,
             llm_summary_workers=int(llm_summary_workers),
             llm_summary_chunk_size=int(llm_summary_chunk_size),
+            llm_summary_batch_size=int(llm_summary_batch_size),
+            total_records_hint=record_count,
         )
 
     embeddings_path: Optional[Path] = None
@@ -1676,11 +2142,14 @@ def run_stage34(
         use_qwen_reranker=bool(use_qwen_reranker),
         rerank_topk=int(rerank_topk),
         rerank_weight=float(rerank_weight),
+        rerank_cache_scope=rerank_cache_scope,
         reranker_cache_path=str(reranker_cache_path.resolve()) if use_qwen_reranker else None,
         text_embed_batch_size=int(text_embed_batch_size),
         text_rerank_batch_size=int(text_rerank_batch_size),
+        text_rerank_max_length=int(text_rerank_max_length),
         llm_summary_workers=int(llm_summary_workers),
         llm_summary_chunk_size=int(llm_summary_chunk_size),
+        llm_summary_batch_size=int(llm_summary_batch_size),
         context_shard_index=context_shard_index,
         context_num_shards=context_num_shards,
         merge_context_shards=False,

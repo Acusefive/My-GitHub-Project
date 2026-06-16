@@ -299,6 +299,31 @@ class OpenAICompatibleJsonClient:
 
 
 class OpenAICompatibleSummarizer(OpenAICompatibleJsonClient):
+    def __init__(self, *args: Any, compact_prompt: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.compact_prompt = bool(compact_prompt)
+
+    def _summary_evidence_line(self, idx: int, evidence: Dict[str, object]) -> str:
+        base = (
+            f"{idx}. evidence_id={idx}; "
+            f"hist_pid={evidence.get('problem_id', '')}; "
+            f"hist_semantic_id={evidence.get('semantic_id', '')}; "
+            f"history_pos={evidence.get('history_pos', '')}; "
+            f"role={evidence.get('role', '')}; "
+            f"overlap={evidence.get('knowledge_overlap', '')}; "
+            f"level_diff={evidence.get('level_diff', '')}; "
+            f"answer={evidence.get('answer_result', '')}; "
+            f"support_score={evidence.get('support_score', '')}; "
+        )
+        if not self.compact_prompt:
+            raw_scores = evidence.get("raw_scores", {})
+            activation = evidence.get("activation", {})
+            base += (
+                f"activation={json.dumps(activation, ensure_ascii=False)}; "
+                f"raw_scores={json.dumps(raw_scores, ensure_ascii=False)}; "
+            )
+        return base + f"text={evidence.get('question_text', '')}"
+
     def build_summary_prompts(
         self,
         *,
@@ -311,24 +336,7 @@ class OpenAICompatibleSummarizer(OpenAICompatibleJsonClient):
     ) -> Tuple[str, str]:
         evidence_lines: List[str] = []
         for idx, evidence in enumerate(evidence_list, start=1):
-            raw_scores = evidence.get("raw_scores", {})
-            activation = evidence.get("activation", {})
-            evidence_lines.append(
-                (
-                    f"{idx}. evidence_id={idx}; "
-                    f"hist_pid={evidence.get('problem_id', '')}; "
-                    f"hist_semantic_id={evidence.get('semantic_id', '')}; "
-                    f"history_pos={evidence.get('history_pos', '')}; "
-                    f"role={evidence.get('role', '')}; "
-                    f"overlap={evidence.get('knowledge_overlap', '')}; "
-                    f"level_diff={evidence.get('level_diff', '')}; "
-                    f"answer={evidence.get('answer_result', '')}; "
-                    f"support_score={evidence.get('support_score', '')}; "
-                    f"activation={json.dumps(activation, ensure_ascii=False)}; "
-                    f"raw_scores={json.dumps(raw_scores, ensure_ascii=False)}; "
-                    f"text={evidence.get('question_text', '')}"
-                )
-            )
+            evidence_lines.append(self._summary_evidence_line(idx, evidence))
 
         prompt = (
             "你是一个教育认知诊断压缩器。\n\n"
@@ -393,7 +401,18 @@ class OpenAICompatibleSummarizer(OpenAICompatibleJsonClient):
         last_exc: Optional[Exception] = None
         last_raw_json = ""
         for attempt in range(3):
-            obj = self.request_json(system_prompt=system_prompt, user_prompt=current_user_prompt)
+            try:
+                obj = self.request_json(system_prompt=system_prompt, user_prompt=current_user_prompt)
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= 2:
+                    break
+                current_user_prompt = self._strict_summary_regeneration_prompt(
+                    original_user_prompt=user_prompt,
+                    error=exc,
+                    invalid_json="",
+                )
+                continue
             raw_json = json.dumps(obj, ensure_ascii=False)
             last_raw_json = raw_json
             try:
@@ -403,12 +422,10 @@ class OpenAICompatibleSummarizer(OpenAICompatibleJsonClient):
                 last_exc = exc
                 if attempt >= 2:
                     break
-                current_user_prompt = (
-                    "你上一次输出的 JSON 不合法，请严格修复。\n"
-                    "必须只包含 mastered_concepts, weak_concepts, transfer_state, risk_level, evidence_quality, diagnosis 这 6 个字段；"
-                    "mastered_concepts 和 weak_concepts 必须是数组；risk_level/evidence_quality 只能是 低、中、高；diagnosis 不能为空。\n\n"
-                    f"原始非法 JSON:\n{raw_json}\n\n"
-                    f"错误原因: {exc}"
+                current_user_prompt = self._strict_summary_regeneration_prompt(
+                    original_user_prompt=user_prompt,
+                    error=exc,
+                    invalid_json=raw_json,
                 )
 
         hard_schema_prompt = (
@@ -430,6 +447,30 @@ class OpenAICompatibleSummarizer(OpenAICompatibleJsonClient):
             f"Invalid LLM diagnosis for target_pid={target_pid}, target_semantic_id={target_semantic_id}: {last_exc}. "
             f"raw_obj={last_raw_json}"
         ) from last_exc
+
+    @staticmethod
+    def _strict_summary_regeneration_prompt(
+        *,
+        original_user_prompt: str,
+        error: Exception,
+        invalid_json: str = "",
+    ) -> str:
+        invalid_block = f"\n上一次非法 JSON:\n{invalid_json}\n" if str(invalid_json or "").strip() else ""
+        return (
+            "上一次输出不是可解析的合法 JSON。请重新生成，不要修补原字符串。\n"
+            "你必须只输出一个 JSON object，不能输出 Markdown、解释、代码块或 <think>。\n"
+            "顶层字段必须且只能是：mastered_concepts, weak_concepts, transfer_state, risk_level, evidence_quality, diagnosis。\n"
+            "mastered_concepts 和 weak_concepts 必须是数组；每个元素必须是 "
+            "{\"concept\":\"...\",\"evidence_ids\":[1],\"confidence\":\"低|中|高\"}。\n"
+            "risk_level 和 evidence_quality 只能是 \"低\"、\"中\"、\"高\"。\n"
+            "evidence_ids 只能引用输入证据编号；没有可靠证据时用空数组。\n"
+            "diagnosis 必须是 1 句中文，长度不超过 60 字。\n"
+            "不要在字符串里使用未转义的双引号；如果需要引用题干内容，请改写而不是复制。\n"
+            f"错误原因: {type(error).__name__}: {error}\n"
+            f"{invalid_block}\n"
+            "原始任务如下：\n"
+            f"{original_user_prompt}"
+        )
 
     def summarize(
         self,
@@ -456,33 +497,14 @@ class OpenAICompatibleSummarizer(OpenAICompatibleJsonClient):
             target_semantic_id=target_semantic_id,
         )
 
-    @staticmethod
-    def _summary_evidence_lines(evidence_list: Iterable[Dict[str, object]]) -> List[str]:
+    def _summary_evidence_lines(self, evidence_list: Iterable[Dict[str, object]]) -> List[str]:
         evidence_lines: List[str] = []
         for idx, evidence in enumerate(evidence_list, start=1):
-            raw_scores = evidence.get("raw_scores", {})
-            activation = evidence.get("activation", {})
-            evidence_lines.append(
-                (
-                    f"{idx}. evidence_id={idx}; "
-                    f"hist_pid={evidence.get('problem_id', '')}; "
-                    f"hist_semantic_id={evidence.get('semantic_id', '')}; "
-                    f"history_pos={evidence.get('history_pos', '')}; "
-                    f"role={evidence.get('role', '')}; "
-                    f"overlap={evidence.get('knowledge_overlap', '')}; "
-                    f"level_diff={evidence.get('level_diff', '')}; "
-                    f"answer={evidence.get('answer_result', '')}; "
-                    f"support_score={evidence.get('support_score', '')}; "
-                    f"activation={json.dumps(activation, ensure_ascii=False)}; "
-                    f"raw_scores={json.dumps(raw_scores, ensure_ascii=False)}; "
-                    f"text={evidence.get('question_text', '')}"
-                )
-            )
+            evidence_lines.append(self._summary_evidence_line(idx, evidence))
         return evidence_lines
 
-    @classmethod
-    def _summary_case_block(cls, case: Dict[str, object]) -> str:
-        evidence_lines = cls._summary_evidence_lines(case.get("evidence_list", []) or [])
+    def _summary_case_block(self, case: Dict[str, object]) -> str:
+        evidence_lines = self._summary_evidence_lines(case.get("evidence_list", []) or [])
         target_concepts = case.get("target_concepts", []) or []
         return (
             f"案例ID: {case.get('case_id', '')}\n"
@@ -582,7 +604,24 @@ class OpenAICompatibleSummarizer(OpenAICompatibleJsonClient):
         last_exc: Optional[Exception] = None
         last_raw_json = ""
         for attempt in range(3):
-            obj = self.request_json(system_prompt=system_prompt, user_prompt=current_user_prompt)
+            try:
+                obj = self.request_json(system_prompt=system_prompt, user_prompt=current_user_prompt)
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= 2:
+                    break
+                current_user_prompt = (
+                    "上一次输出的批量 JSON 不能解析。请重新生成，不要修补原字符串。\n"
+                    "只能输出一个 JSON object，顶层必须且只能包含 items。\n"
+                    "items 必须覆盖所有 case_id；每个 item 只能包含 case_id 和 summary。\n"
+                    "每个 summary 必须只包含 mastered_concepts, weak_concepts, transfer_state, risk_level, evidence_quality, diagnosis 这 6 个字段。\n"
+                    "risk_level/evidence_quality/confidence 只能使用 低、中、高。\n"
+                    f"必须覆盖的 case_id: {json.dumps(case_ids, ensure_ascii=False)}\n"
+                    f"错误原因: {type(exc).__name__}: {exc}\n\n"
+                    "原始任务如下：\n"
+                    f"{user_prompt}"
+                )
+                continue
             raw_json = json.dumps(obj, ensure_ascii=False)
             last_raw_json = raw_json
             try:

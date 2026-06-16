@@ -1,9 +1,23 @@
+"""Context 编码、隐藏状态融合与预测 logit 修正模块。
+
+基础知识追踪模型负责从答题历史生成隐藏状态；本文件负责把 Stage 3.4
+生成的认知上下文接入基础模型。上下文有两条作用路径：
+1. ContextFusion：把上下文表示融合进基础模型隐藏状态；
+2. ContextLogitHead：直接从上下文产生一个附加预测 logit。
+"""
+
 import torch
 
 from torch.nn import Dropout, GELU, LayerNorm, Linear, Module, ModuleList, Parameter, ReLU, Sequential, Sigmoid
 
 
 class ContextEncoder(Module):
+    """把一种或多种原始 Context 特征编码到统一的低维表示空间。
+
+    当 ``group_dims`` 有效时，各组特征会先独立编码，再拼接并投影。
+    这样可以避免文本向量、结构化向量和数值特征因维度差异互相淹没。
+    """
+
     def __init__(
         self,
         ctx_dim: int,
@@ -55,6 +69,7 @@ class ContextEncoder(Module):
             )
 
     def forward(self, ctx: torch.Tensor) -> torch.Tensor:
+        """编码形状为 ``[..., ctx_dim]`` 的上下文张量。"""
         if self.group_dims:
             chunks = torch.split(ctx, self.group_dims, dim=-1)
             encoded = [net(chunk) for net, chunk in zip(self.group_nets, chunks)]
@@ -63,6 +78,15 @@ class ContextEncoder(Module):
 
 
 class ContextFusion(Module):
+    """将编码后的 Context 融合进基础知识追踪模型的隐藏状态。
+
+    支持四种模式：
+    - ``add``：直接相加；
+    - ``concat``：拼接后线性投影；
+    - ``gate``：在基础状态和 Context 状态之间插值；
+    - ``residual_gate``：保留基础状态，再叠加门控 Context 残差。
+    """
+
     def __init__(
         self,
         hidden_dim: int,
@@ -113,6 +137,7 @@ class ContextFusion(Module):
         self.reset_usage_stats()
 
     def reset_usage_stats(self) -> None:
+        """清空一个训练或评估阶段内累计的门控使用统计。"""
         self._usage_steps = 0
         self._gate_mean_sum = 0.0
         self._ctx_weight_mean_sum = 0.0
@@ -120,6 +145,7 @@ class ContextFusion(Module):
         self._gate_high_frac_sum = 0.0
 
     def get_usage_stats(self) -> dict[str, float]:
+        """返回门控均值、Context 权重等诊断指标。"""
         if self.mode not in {"gate", "residual_gate"} or self._usage_steps <= 0:
             return {
                 "fusion_mode": self.mode,
@@ -138,6 +164,7 @@ class ContextFusion(Module):
         }
 
     def _record_gate_stats(self, gate: torch.Tensor, ctx_weight: torch.Tensor) -> None:
+        """记录门控统计，但不让统计计算进入反向传播图。"""
         with torch.no_grad():
             gate_detached = gate.detach()
             ctx_weight_detached = ctx_weight.detach()
@@ -148,6 +175,7 @@ class ContextFusion(Module):
             self._gate_high_frac_sum += float((gate_detached > 0.9).float().mean().item())
 
     def encode_context(self, ctx: torch.Tensor | None) -> torch.Tensor | None:
+        """统一处理无 Context 场景，便于各基础模型复用。"""
         if ctx is None:
             return None
         return self.ctx_encoder(ctx)
@@ -158,6 +186,7 @@ class ContextFusion(Module):
         ctx: torch.Tensor | None,
         ctx_encoded: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """把 Context 融合到与其时间位置对齐的基础隐藏状态。"""
         if ctx is None and ctx_encoded is None:
             return hidden
         if ctx_encoded is None:
@@ -169,6 +198,8 @@ class ContextFusion(Module):
             raise ValueError(f"hidden last dim must be {self.hidden_dim}, got {hidden.shape[-1]}")
         if hidden.shape[:-1] != ctx_hidden.shape[:-1]:
             raise ValueError(f"hidden and context leading dims must match, got {hidden.shape} and {ctx_hidden.shape}")
+        # gate 模式在基础状态和 Context 状态之间插值，因此 gate 越大越依赖基础模型；
+        # residual_gate 始终保留基础状态，gate 表示额外加入多少 Context 修正量。
         if self.mode == "add":
             fused = hidden + ctx_hidden
         elif self.mode == "concat":
@@ -187,6 +218,11 @@ class ContextFusion(Module):
 
 
 class ContextLogitHead(Module):
+    """根据 Context 单独预测一个 logit，并将其作为基础预测的修正项。
+
+    这条路径允许 Context 直接影响最终正确率，而不必完全依赖隐藏状态融合。
+    """
+
     def __init__(
         self,
         ctx_dim: int,
@@ -215,13 +251,17 @@ class ContextLogitHead(Module):
         return self.scale
 
     def effective_scale(self) -> torch.Tensor:
+        """返回 Context logit 实际使用的缩放系数。"""
         if self.ctx_logit_mode == "none":
             return self.scale.new_tensor(0.0)
         if self.ctx_logit_mode == "raw":
             return self.scale.new_tensor(1.0)
+        # scaled 模式保存无约束参数，但通过 sigmoid 将实际贡献限制在 [0, 1]；
+        # 因而可以用较小的初始值让模型先主要依赖基础预测。
         return torch.sigmoid(self.ctx_logit_scale)
 
     def get_usage_stats(self) -> dict[str, float | str]:
+        """返回 Context logit 模式、实际缩放值和原始参数值。"""
         scale = self.effective_scale()
         return {
             "ctx_logit_mode": self.ctx_logit_mode,
@@ -230,11 +270,13 @@ class ContextLogitHead(Module):
         }
 
     def forward(self, ctx: torch.Tensor | None) -> torch.Tensor | None:
+        """从已编码的 Context 生成逐时间步的附加 logit。"""
         if ctx is None or self.ctx_logit_mode == "none":
             return None
         return self.net(ctx).squeeze(-1)
 
     def apply_to_logits(self, logits: torch.Tensor, ctx_logits: torch.Tensor | None) -> torch.Tensor:
+        """按配置把 Context logit 加到基础模型 logit 上。"""
         if ctx_logits is None or self.ctx_logit_mode == "none":
             return logits
         if self.ctx_logit_mode == "raw":

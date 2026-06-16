@@ -1,3 +1,13 @@
+"""知识追踪数据集：构造答题序列、Context 序列和无泄漏评估样本。
+
+两种划分模式：
+- ``user``：保留完整学生序列，之后由训练入口按学生切分训练/验证/测试；
+- ``new_concept``：按知识点切分，验证和测试目标只能使用训练知识点历史。
+
+每条模型样本包含题目、作答结果、评估掩码以及多种 Context。Context 在位置 t
+描述“预测第 t 次作答时可使用的历史证据”，随后由 collate 函数与预测目标对齐。
+"""
+
 from __future__ import annotations
 
 import pickle
@@ -8,7 +18,8 @@ import numpy as np
 from torch.utils.data import Dataset
 
 from dataloader.context_map import ContextEmbeddingMap
-from scripts.common_pipeline_strict.io_utils import load_problem_records, load_student_sequences
+from scripts.common_pipeline_strict.io_utils import (load_problem_records,
+                                                     load_student_sequences)
 
 
 def split_new_concepts(
@@ -18,6 +29,7 @@ def split_new_concepts(
     test_concept_ratio: float,
     valid_concept_ratio: float,
 ) -> Tuple[set[str], set[str], set[str]]:
+    """按固定随机种子把知识点划分为训练、验证和测试集合。"""
     concepts = sorted(str(concept) for concept in all_concepts)
     shuffled_concepts = np.asarray(concepts, dtype=object)
     if len(shuffled_concepts) > 0:
@@ -64,6 +76,11 @@ def match_seq_len_with_context(
     List[np.ndarray],
     List[str],
 ]:
+    """把长序列切成固定长度窗口，并同步切分所有 Context 与评估掩码。
+
+    每个窗口保留 ``seq_len + 1`` 个位置，因为训练时前 ``seq_len`` 个位置作为
+    历史输入，后移一位的序列作为预测目标。最后不足长度的窗口使用 padding。
+    """
     proc_q: List[np.ndarray] = []
     proc_r: List[np.ndarray] = []
     proc_eval_masks: List[np.ndarray] = []
@@ -132,6 +149,8 @@ def match_seq_len_with_context(
 
 
 class MOOCRadarStrict(Dataset):
+    """为 Context 增强知识追踪训练提供统一的数据集接口。"""
+
     def __init__(
         self,
         seq_len: int,
@@ -150,7 +169,9 @@ class MOOCRadarStrict(Dataset):
         valid_concept_ratio: float = 0.0,
         cache_preprocessed: bool = True,
         context_storage_dtype: str = "float32",
+        load_context_embeddings: bool = True,
     ) -> None:
+        """初始化数据集，优先读取缓存，否则按指定划分规则预处理原始数据。"""
         super().__init__()
 
         self.seq_len = int(seq_len)
@@ -167,6 +188,7 @@ class MOOCRadarStrict(Dataset):
         self.test_concept_ratio = float(test_concept_ratio)
         self.valid_concept_ratio = float(valid_concept_ratio)
         self.cache_preprocessed = bool(cache_preprocessed)
+        self.load_context_embeddings = bool(load_context_embeddings)
         if context_storage_dtype not in {"float32", "float16"}:
             raise ValueError(f"Unsupported context_storage_dtype: {context_storage_dtype}")
         self.context_storage_dtype = np.float16 if context_storage_dtype == "float16" else np.float32
@@ -176,9 +198,13 @@ class MOOCRadarStrict(Dataset):
             raise ValueError("split_role must be train, train_valid, valid, or test when split_mode=new_concept")
         self.dataset_dir.mkdir(parents=True, exist_ok=True)
 
-        extra_features_path = self.context_embeddings_path.with_suffix(".extra_features.npy")
-        extra_features_tag = f"_extra{extra_features_path.stat().st_size}" if extra_features_path.exists() else ""
-        context_tag = f"{self.context_embeddings_path.stem}_{self.context_embeddings_path.stat().st_size}{extra_features_tag}"
+        # 缓存名包含数据划分和 Context 文件体积，避免错误复用其他实验的预处理结果。
+        if self.load_context_embeddings:
+            extra_features_path = self.context_embeddings_path.with_suffix(".extra_features.npy")
+            extra_features_tag = f"_extra{extra_features_path.stat().st_size}" if extra_features_path.exists() else ""
+            context_tag = f"{self.context_embeddings_path.stem}_{self.context_embeddings_path.stat().st_size}{extra_features_tag}"
+        else:
+            context_tag = "no_context_embeddings"
         split_tag = (
             f"{self.split_mode}_{self.split_role}_seq{self.seq_len}_seed{self.seed}_"
             f"test{str(self.test_concept_ratio).replace('.', 'p')}_"
@@ -208,6 +234,8 @@ class MOOCRadarStrict(Dataset):
             "split_stats": cache_prefix.with_name(cache_prefix.name + "_split_stats.pkl"),
         }
 
+        # 新知识点验证/测试按“一个目标交互一个样本”动态构造，避免把所有目标窗口
+        # 预先展开到内存中；训练集和普通 user 模式则可直接缓存完整数组。
         self.lazy_test = self.split_mode == "new_concept" and self.split_role in {"valid", "test"}
         if self.lazy_test:
             self._preprocess_lazy_test()
@@ -316,22 +344,30 @@ class MOOCRadarStrict(Dataset):
         self,
         log_items,
         q2idx: Dict[str, int],
-        context_map: ContextEmbeddingMap,
+        context_map: ContextEmbeddingMap | None,
         user_id: str,
         zero_ctx: np.ndarray,
         zero_struct_ctx: np.ndarray,
         zero_struct_feature_ctx: np.ndarray,
     ):
+        """把一段交互日志转换为题目、作答结果和各类 Context 的对齐数组。"""
         q_seq = np.asarray([q2idx[str(log["problem_id"])] for _, log in log_items], dtype=np.int64)
         r_seq = np.asarray([int(log.get("is_correct") or 0) for _, log in log_items], dtype=np.int64)
-        ctx_main_seq = np.zeros((len(log_items), context_map.context_dim), dtype=self.context_storage_dtype)
-        ctx_tpl_seq = np.zeros((len(log_items), context_map.context_dim), dtype=self.context_storage_dtype)
-        ctx_llm_seq = np.zeros((len(log_items), context_map.context_dim), dtype=self.context_storage_dtype)
-        ctx_llm_struct_seq = np.zeros((len(log_items), context_map.llm_struct_dim), dtype=self.context_storage_dtype)
-        ctx_llm_struct_feature_seq = np.zeros((len(log_items), context_map.llm_struct_feature_dim), dtype=self.context_storage_dtype)
+        context_dim = context_map.context_dim if context_map is not None else 0
+        llm_struct_dim = context_map.llm_struct_dim if context_map is not None else 0
+        llm_struct_feature_dim = context_map.llm_struct_feature_dim if context_map is not None else 0
+        ctx_main_seq = np.zeros((len(log_items), context_dim), dtype=self.context_storage_dtype)
+        ctx_tpl_seq = np.zeros((len(log_items), context_dim), dtype=self.context_storage_dtype)
+        ctx_llm_seq = np.zeros((len(log_items), context_dim), dtype=self.context_storage_dtype)
+        ctx_llm_struct_seq = np.zeros((len(log_items), llm_struct_dim), dtype=self.context_storage_dtype)
+        ctx_llm_struct_feature_seq = np.zeros((len(log_items), llm_struct_feature_dim), dtype=self.context_storage_dtype)
 
         for pos, (target_t, log) in enumerate(log_items):
+            # 窗口中第一个交互前没有模型可见状态；其 Context 在后续移位时也不会用于
+            # 预测，因此保持为零，真正的预测目标从第二个位置开始。
             if pos == 0:
+                continue
+            if context_map is None:
                 continue
             pid = str(log["problem_id"])
             key = (user_id, target_t, pid)
@@ -371,6 +407,7 @@ class MOOCRadarStrict(Dataset):
         arrays,
         eval_mask,
     ) -> None:
+        """将一条已构造序列同步追加到全部结果列表。"""
         q_seq, r_seq, ctx_main_seq, ctx_tpl_seq, ctx_llm_seq, ctx_llm_struct_seq, ctx_llm_struct_feature_seq = arrays
         q_seqs.append(q_seq)
         r_seqs.append(r_seq)
@@ -383,9 +420,10 @@ class MOOCRadarStrict(Dataset):
         seq_user_ids.append(user_id)
 
     def _preprocess_lazy_test(self) -> None:
+        """为新知识点验证/测试建立轻量索引，不预先展开每个目标窗口。"""
         problem_records = load_problem_records(self.problem_json)
         student_sequences = load_student_sequences(self.student_json)
-        self.context_map = ContextEmbeddingMap(self.context_embeddings_path)
+        self.context_map = ContextEmbeddingMap(self.context_embeddings_path) if self.load_context_embeddings else None
 
         self.q_list = np.asarray(sorted({problem.problem_id for problem in problem_records}))
         self.u_list = np.asarray([sequence.user_id for sequence in student_sequences])
@@ -393,12 +431,12 @@ class MOOCRadarStrict(Dataset):
         self.u2idx = {uid: idx for idx, uid in enumerate(self.u_list.tolist())}
         pid2concepts = {problem.problem_id: set(problem.concepts) for problem in problem_records}
 
-        self.context_dim = self.context_map.context_dim
-        self.has_llm_context = self.context_map.has_llm
-        self.llm_struct_dim = self.context_map.llm_struct_dim
-        self.has_llm_struct_context = self.context_map.has_llm_struct
-        self.llm_struct_feature_dim = self.context_map.llm_struct_feature_dim
-        self.has_llm_struct_feature_context = self.context_map.has_llm_struct_features
+        self.context_dim = self.context_map.context_dim if self.context_map is not None else 0
+        self.has_llm_context = self.context_map.has_llm if self.context_map is not None else False
+        self.llm_struct_dim = self.context_map.llm_struct_dim if self.context_map is not None else 0
+        self.has_llm_struct_context = self.context_map.has_llm_struct if self.context_map is not None else False
+        self.llm_struct_feature_dim = self.context_map.llm_struct_feature_dim if self.context_map is not None else 0
+        self.has_llm_struct_feature_context = self.context_map.has_llm_struct_features if self.context_map is not None else False
         self.zero_ctx = np.zeros((self.context_dim,), dtype=self.context_storage_dtype)
         self.zero_struct_ctx = np.zeros((self.llm_struct_dim,), dtype=self.context_storage_dtype)
         self.zero_struct_feature_ctx = np.zeros((self.llm_struct_feature_dim,), dtype=self.context_storage_dtype)
@@ -436,6 +474,8 @@ class MOOCRadarStrict(Dataset):
             has_old_history = False
             user_idx = len(self.lazy_sequences)
 
+            # old_mask 只标记训练知识点交互；test_samples 只登记有可用旧知识历史的
+            # 验证/测试目标。取样时再向前扫描，从而节省大量重复窗口占用的内存。
             for pos, pid in enumerate(pids):
                 concepts = pid2concepts.get(pid, set())
                 if concepts & target_concepts:
@@ -488,6 +528,7 @@ class MOOCRadarStrict(Dataset):
         }
 
     def _get_lazy_test_item(self, index):
+        """按目标索引即时构造一个无泄漏的新知识点评估窗口。"""
         user_idx, target_pos = self.test_samples[index]
         record = self.lazy_sequences[user_idx]
         positions = []
@@ -512,7 +553,11 @@ class MOOCRadarStrict(Dataset):
 
         user_id = record["user_id"]
         for out_pos, src_pos in enumerate(positions):
+            # positions[0] 前没有模型输入窗口内的状态；其 Context 在移位后不会用于
+            # 预测，因此保持为零。
             if out_pos == 0:
+                continue
+            if self.context_map is None:
                 continue
             pid = record["pids"][src_pos]
             key = (user_id, int(record["target_ts"][src_pos]), pid)
@@ -547,9 +592,15 @@ class MOOCRadarStrict(Dataset):
         )
 
     def preprocess(self):
+        """预处理完整数据，并根据 ``split_mode/split_role`` 构造所需序列。
+
+        ``user`` 模式保留每个学生的有效完整序列。
+        ``new_concept`` 模式严格控制哪些知识点可以进入历史，验证/测试样本仅在
+        最后一个位置开启 eval_mask，从而只评估指定的新知识点目标。
+        """
         problem_records = load_problem_records(self.problem_json)
         student_sequences = load_student_sequences(self.student_json)
-        context_map = ContextEmbeddingMap(self.context_embeddings_path)
+        context_map = ContextEmbeddingMap(self.context_embeddings_path) if self.load_context_embeddings else None
 
         q_list = np.asarray(sorted({problem.problem_id for problem in problem_records}))
         u_list = np.asarray([sequence.user_id for sequence in student_sequences])
@@ -566,9 +617,12 @@ class MOOCRadarStrict(Dataset):
         ctx_llm_struct_seqs: List[np.ndarray] = []
         ctx_llm_struct_feature_seqs: List[np.ndarray] = []
         seq_user_ids: List[str] = []
-        zero_ctx = np.zeros((context_map.context_dim,), dtype=self.context_storage_dtype)
-        zero_struct_ctx = np.zeros((context_map.llm_struct_dim,), dtype=self.context_storage_dtype)
-        zero_struct_feature_ctx = np.zeros((context_map.llm_struct_feature_dim,), dtype=self.context_storage_dtype)
+        context_dim = context_map.context_dim if context_map is not None else 0
+        llm_struct_dim = context_map.llm_struct_dim if context_map is not None else 0
+        llm_struct_feature_dim = context_map.llm_struct_feature_dim if context_map is not None else 0
+        zero_ctx = np.zeros((context_dim,), dtype=self.context_storage_dtype)
+        zero_struct_ctx = np.zeros((llm_struct_dim,), dtype=self.context_storage_dtype)
+        zero_struct_feature_ctx = np.zeros((llm_struct_feature_dim,), dtype=self.context_storage_dtype)
 
         all_concepts = sorted({concept for concepts in pid2concepts.values() for concept in concepts})
         train_concepts, valid_concepts, test_concepts = split_new_concepts(
@@ -618,6 +672,8 @@ class MOOCRadarStrict(Dataset):
                 )
                 continue
 
+            # valid/test 中，保留知识点目标只能读取更早的训练知识点交互；目标本身
+            # 不会加入 old_history，防止其答案泄漏到后续保留知识点预测中。
             old_history = []
             train_logs = []
             for target_t, log in filtered_logs:
@@ -657,11 +713,13 @@ class MOOCRadarStrict(Dataset):
                         eval_mask,
                     )
                 elif self.split_role == "train_valid" and not (concepts & test_concepts):
+                    # 最终 train+valid 拟合允许使用验证知识点，但始终排除测试知识点。
                     train_logs.append((target_t, log))
                     old_history.append((target_t, log))
                     train_target_concepts.update(concepts & (train_concepts | valid_concepts))
                     train_target_interactions += 1
                 elif not (concepts & holdout_concepts):
+                    # 独立 train/valid/test 数据集都不允许验证或测试知识点进入历史。
                     if self.split_role in {"train", "valid", "test"}:
                         train_logs.append((target_t, log))
                     old_history.append((target_t, log))
@@ -727,12 +785,12 @@ class MOOCRadarStrict(Dataset):
             u_list,
             q2idx,
             u2idx,
-            context_map.context_dim,
-            context_map.has_llm,
-            context_map.llm_struct_dim,
-            context_map.has_llm_struct,
-            context_map.llm_struct_feature_dim,
-            context_map.has_llm_struct_features,
+            context_dim,
+            context_map.has_llm if context_map is not None else False,
+            llm_struct_dim,
+            context_map.has_llm_struct if context_map is not None else False,
+            llm_struct_feature_dim,
+            context_map.has_llm_struct_features if context_map is not None else False,
             seq_user_ids,
             split_stats,
         )

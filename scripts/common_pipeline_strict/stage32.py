@@ -1,3 +1,16 @@
+"""Stage 3.2：构建后续 Context 检索所需的题目先验。
+
+该阶段把题目元数据和学生交互历史转换为一组可复用产物：
+1. 题目文本向量与层级语义 ID；
+2. Rasch 题目难度以及按知识点组织的认知方向；
+3. 结合文本、语义 ID 和难度方向的题目语义向量 ``eqsem``；
+4. 基于共同作答行为的协同邻居/协同向量；
+5. 基于知识点共现及可选 LLM 补全的知识图；
+6. 根据历史交互训练的动态诊断先验模型。
+
+Stage 3.4 会读取本阶段产物，为每个预测目标检索和排序历史认知证据。
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -46,6 +59,8 @@ from .retrieval_models import QwenEmbeddingEncoder
 
 @dataclass
 class Stage32Result:
+    """完整 Stage 3.2 运行结果及全部产物路径。"""
+
     priors_dir: str
     semantic_ids_path: str
     semantic_id_audit_path: str
@@ -69,6 +84,8 @@ class Stage32Result:
 
 @dataclass
 class Stage32CoreArtifactsResult:
+    """仅生成语义 ID、协同邻居和题目目录时的轻量运行结果。"""
+
     priors_dir: str
     semantic_ids_path: str
     semantic_id_audit_path: str
@@ -81,6 +98,8 @@ class Stage32CoreArtifactsResult:
 
 @dataclass
 class ProblemCatalogRecord:
+    """Stage 3.4 使用的统一题目目录记录。"""
+
     problem_id: str
     semantic_id: str
     text: str
@@ -545,6 +564,12 @@ def build_semantic_ids(
     semantic_ids_path: Path,
     semantic_id_source: str = "auto",
 ) -> Tuple[Dict[str, str], List[str], Dict[str, Any]]:
+    """为每道题构造层级语义 ID，并生成可审计报告。
+
+    ``concept`` 模式直接使用清洗后的知识点/章节信息；``cluster`` 模式先对题目
+    文本向量做全局聚类，再在每个全局簇内做局部聚类。``auto`` 会在知识点元数据
+    覆盖率足够高时优先使用 concept 模式。
+    """
     source = str(semantic_id_source or "auto").strip().lower()
     if source not in {"auto", "cluster", "concept"}:
         raise ValueError(f"Unsupported semantic_id_source: {semantic_id_source}")
@@ -562,6 +587,7 @@ def build_semantic_ids(
         audit_report["generation_stats"]["concept_coverage"] = round(float(concept_coverage), 4)
         return semantic_ids, semantic_texts, audit_report
 
+    # cluster 模式采用“宏观簇 -> 局部簇”的两层聚类，生成可解释的层级语义标识。
     problem_ids = [problem.problem_id for problem in problem_records]
     texts = [_semantic_cluster_text(problem) for problem in problem_records]
     k1 = min(KGLOBAL, len(problem_ids))
@@ -609,6 +635,11 @@ def estimate_rasch_mu_q(
     *,
     seed: int,
 ) -> Dict[str, float]:
+    """使用一参数 Rasch 模型估计题目难度系数 ``mu_q``。
+
+    用户能力 ``theta`` 与题目难度 ``b_q`` 联合拟合，最终将难度压缩到有限范围，
+    后续用于沿知识点认知方向修正题目基础表示。
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -642,6 +673,7 @@ def estimate_rasch_mu_q(
 
     for _ in range(RASCH_EPOCHS):
         optimizer.zero_grad()
+        # Rasch 模型：P(答对) = sigmoid(学生能力 theta - 题目难度 b_q)。
         logits = theta[u_idx] - b_q[q_idx]
         loss_nll = loss_fn(logits, y)
         loss_reg = RASCH_LAMBDA_THETA * torch.mean(theta.pow(2)) + RASCH_LAMBDA_MU * torch.mean(b_q.pow(2))
@@ -649,11 +681,13 @@ def estimate_rasch_mu_q(
         loss.backward()
         optimizer.step()
         with torch.no_grad():
+            # theta 与 b_q 同时平移不会改变似然，因此将 b_q 中心化以固定不可辨识自由度。
             b_q -= torch.mean(b_q)
 
     idx_to_pid = {idx: pid for pid, idx in pid_to_idx.items()}
     out: Dict[str, float] = {}
     for idx, pid in idx_to_pid.items():
+        # 用 tanh 限制难度修正幅度，避免极端题目对语义向量造成过大偏移。
         out[pid] = float(np.tanh(RASCH_A * float(b_q[idx].detach().cpu().item())))
     return out
 
@@ -664,6 +698,7 @@ def build_concept_pc1_directions(
     *,
     concept_groups: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
 ) -> Dict[str, np.ndarray]:
+    """为每个知识点计算从低认知层级指向高认知层级的主方向。"""
     if concept_groups is None:
         concept_groups = build_concept_groups(problem_records)
 
@@ -678,6 +713,8 @@ def build_concept_pc1_directions(
             continue
         matrix = torch.tensor(eqbase_vectors[positions], dtype=torch.float32)
         centered = matrix - torch.mean(matrix, dim=0, keepdim=True)
+        # PCA 第一主成分的正负号本身不确定，因此按认知层级均值统一方向，
+        # 使 ``mu_q * d_c(q)`` 在不同知识点上具有一致含义。
         _, _, v_h = torch.linalg.svd(centered, full_matrices=False)
         pc1 = v_h[0].to(torch.float32)
         levels_t = torch.tensor(concept_levels.tolist(), dtype=torch.int64)
@@ -697,6 +734,7 @@ def build_concept_pc1_directions(
 
 
 def build_concept_groups(problem_records: Sequence[ProblemRecord]) -> Dict[str, Dict[str, np.ndarray]]:
+    """按知识点聚合题目位置及其认知层级，供 PC1 方向计算复用。"""
     concept_to_positions: Dict[str, List[int]] = defaultdict(list)
     concept_to_levels: Dict[str, List[int]] = defaultdict(list)
     for pos, problem in enumerate(problem_records):
@@ -716,6 +754,7 @@ def build_problem_concept_directions(
     problem_records: Sequence[ProblemRecord],
     concept_dirs: Dict[str, np.ndarray],
 ) -> np.ndarray:
+    """将题目涉及的多个知识点方向取均值，得到每道题的认知方向。"""
     out = np.zeros((len(problem_records), DS), dtype=np.float32)
     for pos, problem in enumerate(problem_records):
         vectors = [concept_dirs[concept] for concept in problem.concepts if concept in concept_dirs]
@@ -734,6 +773,7 @@ def build_collaborative_vectors(
     seed: int,
     semantic_ids: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, List[str]], Dict[str, np.ndarray]]:
+    """基于学生作答序列构造题目协同邻居和 Word2Vec 协同向量。"""
     valid_set = set(valid_problem_ids)
     neighbors = build_jaccard_collaborative_neighbors(
         student_sequences,
@@ -774,6 +814,7 @@ def build_jaccard_collaborative_neighbors(
     max_items_per_user: int = 200,
     semantic_ids: Optional[Dict[str, str]] = None,
 ) -> Dict[str, List[str]]:
+    """按共同作答学生集合的 Jaccard 相似度选择题目邻居。"""
     valid_set = set(valid_problem_ids)
     item_user_cnt: Counter = Counter()
     neigh_inter_cnt: Dict[str, Counter] = defaultdict(Counter)
@@ -825,6 +866,7 @@ def fill_collaborative_neighbors_with_semantic_fallback(
     *,
     topk: int,
 ) -> Dict[str, List[str]]:
+    """协同信号不足时，用相同语义 ID 的题目补足邻居。"""
     semantic_groups: Dict[str, List[str]] = defaultdict(list)
     valid_set = set(valid_problem_ids)
     for pid in valid_problem_ids:
@@ -879,6 +921,7 @@ def _llm_graph_completion(
     priors_dir: Path,
     completer: Optional[OpenAICompatibleGraphCompleter],
 ) -> Dict[str, Dict[str, Any]]:
+    """让 LLM 仅从受限候选中补充知识点前置关系和强相关关系。"""
     if completer is None:
         return {}
 
@@ -937,6 +980,11 @@ def build_graph_bundle(
     *,
     llm_graph_completion: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
+    """融合知识点共现边与可选 LLM 边，生成 Stage 3.4 使用的知识图。
+
+    高频共现边直接保留；邻居过少的知识点会用低频共现 top-k 补足。LLM 前置边
+    和相关边拥有更高排序权重，但其候选范围仍受本地统计约束。
+    """
     _concept_to_chapters, local_counts = _collect_concept_stats(problem_records)
 
     adjacency_scores: Dict[str, Counter] = defaultdict(Counter)
@@ -1035,6 +1083,7 @@ def build_training_sequences(
     pid_to_idx: Dict[str, int],
     problem_records: Sequence[ProblemRecord],
 ) -> List[Dict[str, Any]]:
+    """把原始学生日志压缩为训练动态先验模型所需的整数数组。"""
     levels = [problem.cognitive_dimension for problem in problem_records]
     cached: List[Dict[str, Any]] = []
     for sequence in student_sequences:
@@ -1067,6 +1116,7 @@ def build_target_samples(
     smoke: bool,
     seed: int,
 ) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+    """把每个时间步变成预测样本，并按用户哈希稳定划分训练/验证集。"""
     train_samples: List[Tuple[int, int]] = []
     val_samples: List[Tuple[int, int]] = []
     for seq_idx, sequence in enumerate(sequence_cache):
@@ -1101,6 +1151,11 @@ def _batch_loss(
     *,
     device: str,
 ) -> torch.Tensor:
+    """计算一批目标交互的动态诊断二分类损失。
+
+    对每个目标，从有限历史窗口内按语义相似度、层级差和时间距离计算注意力；
+    加权历史得到动态状态输入 ``z``，再由诊断头预测目标是否答对。
+    """
     unique_problem_indices: set[int] = set()
     for seq_idx, t in batch_samples:
         sequence = sequence_cache[seq_idx]
@@ -1147,6 +1202,7 @@ def _batch_loss(
 
         hist_levels_tensor = torch.tensor(hist_levels, dtype=torch.float32, device=device)
         lags_tensor = torch.arange(len(hist_levels), 0, -1, dtype=torch.float32, device=device)
+        # 检索注意力奖励语义相似历史，并惩罚认知层级差和较久远的交互。
         score_tensor = (
             cos_scores
             - float(LAMBDA_L) * torch.abs(hist_levels_tensor - float(target_level))
@@ -1192,6 +1248,11 @@ def train_strict_model(
     smoke: bool,
     seed: int,
 ) -> Tuple[StrictPriorModel, Dict[str, Any]]:
+    """训练题目基础表示与学生动态诊断先验模型。
+
+    每个 epoch 都根据当前题目基础表示重新计算知识点 PC1 方向，随后以
+    ``eqsem = eqbase + mu_q * d_c(q)`` 参与动态诊断训练。
+    """
     pid_to_idx = {problem.problem_id: idx for idx, problem in enumerate(problem_records)}
     sequence_cache = build_training_sequences(student_sequences, pid_to_idx, problem_records)
     train_samples, val_samples = build_target_samples(sequence_cache, smoke=smoke, seed=seed)
@@ -1206,6 +1267,7 @@ def train_strict_model(
     mu_values_tensor = torch.tensor(mu_values.astype(np.float32), dtype=torch.float32, device=device)
 
     def refresh_problem_dcq() -> np.ndarray:
+        """使用当前模型参数刷新题目认知方向，供本轮训练/验证使用。"""
         was_training = model.training
         model.eval()
         with torch.no_grad():
@@ -1326,6 +1388,7 @@ def build_problem_catalog_records(
     problem_records: Sequence[ProblemRecord],
     semantic_ids: Dict[str, str],
 ) -> List[ProblemCatalogRecord]:
+    """将分散的题目字段整理为 Stage 3.4 可直接读取的题目目录。"""
     return [
         ProblemCatalogRecord(
             problem_id=problem.problem_id,
@@ -1352,6 +1415,7 @@ def run_stage32_core_artifacts(
     text_embed_max_length: int = TEXT_EMBED_MAX_LENGTH,
     semantic_id_source: str = "auto",
 ) -> Stage32CoreArtifactsResult:
+    """仅构建不依赖严格先验模型训练的核心检索产物。"""
     ensure_dir(priors_dir)
     problem_records = load_problem_records(
         problem_json,
@@ -1367,6 +1431,7 @@ def run_stage32_core_artifacts(
     if not student_sequences:
         raise ValueError("No student sequences loaded for strict stage 3.2 core artifacts")
 
+    # 题目文本向量既用于语义 ID 聚类，也为后续检索提供文本语义基础。
     encoder = QwenEmbeddingEncoder(
         model_name_or_path=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
         device=pick_device(),
@@ -1437,6 +1502,7 @@ def run_stage32(
     llm_max_tokens: int = 160,
     llm_temperature: float = 0.1,
 ) -> Stage32Result:
+    """执行完整 Stage 3.2，并保存 Stage 3.4 所需的全部先验文件。"""
     ensure_dir(priors_dir)
     problem_records = load_problem_records(
         problem_json,
@@ -1452,6 +1518,7 @@ def run_stage32(
     if not student_sequences:
         raise ValueError("No student sequences loaded for strict stage 3.2")
 
+    # 第一步：编码题目文本并构造层级语义 ID。
     encoder = QwenEmbeddingEncoder(
         model_name_or_path=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
         device=pick_device(),
@@ -1475,6 +1542,7 @@ def run_stage32(
         instruction="Encode hierarchical semantic identifiers for educational problem semantics.",
     )
 
+    # 第二步：估计题目难度，并训练融合文本、语义 ID 与动态历史的严格先验模型。
     pid_to_idx = {problem.problem_id: idx for idx, problem in enumerate(problem_records)}
     pid_to_mu_q = (
         estimate_rasch_mu_q(student_sequences, pid_to_idx, seed=seed)
@@ -1497,6 +1565,7 @@ def run_stage32(
         seed=seed,
     )
 
+    # 第三步：导出训练后的题目基础表示，再沿知识点认知方向加入难度修正。
     with torch.no_grad():
         hqtext_tensor = torch.tensor(hqtext_vectors.astype(np.float32), dtype=torch.float32)
         hqid_tensor = torch.tensor(hqid_vectors.astype(np.float32), dtype=torch.float32)
@@ -1509,6 +1578,7 @@ def run_stage32(
     eqsem_vectors = eqbase_vectors + mu_arr * problem_dcq
     eqsem_vectors = eqsem_vectors.astype(np.float32)
 
+    # 第四步：构建行为协同信号和知识图，作为 Stage 3.4 的补充检索依据。
     collab_neighbors, collab_vectors = build_collaborative_vectors(
         student_sequences,
         [problem.problem_id for problem in problem_records],
@@ -1532,6 +1602,7 @@ def run_stage32(
     )
     graph_bundle = build_graph_bundle(problem_records, llm_graph_completion=llm_graph_completion)
 
+    # 第五步：按稳定文件格式保存向量、图、目录和实现参数，供后续阶段复用。
     semantic_vectors = {problem.problem_id: eqsem_vectors[idx] for idx, problem in enumerate(problem_records)}
     hqtext_map = {problem.problem_id: hqtext_vectors[idx] for idx, problem in enumerate(problem_records)}
     hqid_map = {problem.problem_id: hqid_vectors[idx] for idx, problem in enumerate(problem_records)}

@@ -59,6 +59,11 @@ def main() -> None:
     parser.add_argument("--llm_temperature", type=float, default=0.1)
     parser.add_argument("--llm_disable_thinking", action="store_true")
     parser.add_argument("--llm_use_chat_template_kwargs", action="store_true")
+    parser.add_argument(
+        "--llm_summary_compact_prompt",
+        action="store_true",
+        help="Omit retrieval debug fields such as activation/raw_scores from LLM summary prompts.",
+    )
     parser.add_argument("--llm_summary_workers", type=int, default=LLM_SUMMARY_WORKERS)
     parser.add_argument("--llm_summary_chunk_size", type=int, default=LLM_SUMMARY_CHUNK_SIZE)
     parser.add_argument("--llm_summary_batch_size", type=int, default=1)
@@ -163,6 +168,7 @@ def main() -> None:
         llm_temperature=float(args.llm_temperature),
         llm_disable_thinking=bool(args.llm_disable_thinking),
         llm_use_chat_template_kwargs=bool(args.llm_use_chat_template_kwargs),
+        llm_summary_compact_prompt=bool(args.llm_summary_compact_prompt),
         llm_summary_workers=int(args.llm_summary_workers),
         llm_summary_chunk_size=int(args.llm_summary_chunk_size),
         llm_summary_batch_size=int(args.llm_summary_batch_size),

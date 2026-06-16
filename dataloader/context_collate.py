@@ -36,6 +36,8 @@ def collate_fn_with_context(
         else:
             q_seq, r_seq, ctx_main_seq, ctx_tpl_seq, ctx_llm_seq, ctx_llm_struct_seq, ctx_llm_struct_feature_seq = item
             eval_mask_seq = torch.ones(len(q_seq), dtype=torch.long)
+        # Context at absolute position t describes the prediction target at t, so it
+        # must use the same [1:] shift as qshft/rshft rather than historical q/r.
         q_seqs.append(torch.tensor(q_seq[:-1], dtype=torch.long))
         r_seqs.append(torch.tensor(r_seq[:-1], dtype=torch.long))
         qshft_seqs.append(torch.tensor(q_seq[1:], dtype=torch.long))

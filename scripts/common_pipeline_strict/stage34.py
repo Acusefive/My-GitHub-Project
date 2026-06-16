@@ -1,10 +1,23 @@
+"""Stage 3.4：为每个预测目标构造认知 Context。
+
+本阶段读取 Stage 3.2 的题目语义向量、协同信号、知识图和动态先验模型，
+针对学生序列中的每个目标交互执行以下流程：
+1. 计算学生在当前目标时刻的动态认知先验；
+2. 为历史交互计算知识重合、层级关系、语义、图结构、协同和时间分数；
+3. 第一阶段召回高相关候选，可选用 Qwen reranker 再打分；
+4. 第二阶段加入覆盖收益和冗余惩罚，选择少量互补证据；
+5. 生成 main/template/LLM Context，并编码成知识追踪模型可读取的向量。
+
+文件还包含分片生成、缓存预热、LLM 总结和断点续跑等工程支持逻辑。
+"""
+
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
 import pickle
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -13,71 +26,32 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from .constants import (
-    ALPHA_TIME,
-    BETA_NEG,
-    BETA_POS,
-    COVERAGE_WEIGHTS,
-    DELTA_GRAPH,
-    EPS,
-    EXPLICIT_MATCH_WEIGHTS,
-    GAMMA_HIGH,
-    GAMMA_PRE,
-    HISTORY_WINDOW,
-    K1_DEFAULT,
-    K2_DEFAULT,
-    LLM_SUMMARY_CHUNK_SIZE,
-    LLM_SUMMARY_WORKERS,
-    LAMBDA_COV,
-    LAMBDA_RED,
-    QUESTION_TEXT_ELLIPSIS,
-    QUESTION_TEXT_LIMIT,
-    REDUNDANCY_WEIGHTS,
-    RERANK_TOPK,
-    RERANK_WEIGHT,
-    ROLE_LABELS,
-    ROLE_ORDER,
-    ROLE_PRIORITY,
-    ROLE_THRESHOLDS,
-    RHO,
-    SUMMARY_TEMPLATE,
-    SUPPORT_SCORE_DECIMALS,
-    TEXT_EMBED_BATCH_SIZE,
-    TEXT_EMBED_MAX_LENGTH,
-    TEXT_EMBED_MODEL_NAME,
-    TEXT_RERANK_BATCH_SIZE,
-    TEXT_RERANK_MAX_LENGTH,
-    TEXT_RERANK_MODEL_NAME,
-    USE_QWEN_RERANKER,
-    WEIGHT_STAGE1,
-    WEIGHT_STAGE2,
-)
-from .io_utils import (
-    atomic_save_text,
-    ensure_dir,
-    format_float,
-    load_problem_records,
-    load_student_sequences,
-    pick_device,
-    write_json,
-)
-from .llm_utils import (
-    OpenAICompatibleSummarizer,
-    append_summary_cache_entries,
-    load_json_cache,
-    load_summary_cache,
-    parse_llm_summary_json,
-    summary_cache_key,
-)
-from .llm_summary_signatures import (
-    LLM_SUMMARY_SIGNATURE_PREFIX,
-    llm_summary_signature_key,
-    summarize_llm_record,
-    summarize_llm_records_batch,
-)
+from .constants import (ALPHA_TIME, BETA_NEG, BETA_POS, COVERAGE_WEIGHTS,
+                        DELTA_GRAPH, EPS, EXPLICIT_MATCH_WEIGHTS, GAMMA_HIGH,
+                        GAMMA_PRE, HISTORY_WINDOW, K1_DEFAULT, K2_DEFAULT,
+                        LAMBDA_COV, LAMBDA_RED, LLM_SUMMARY_CHUNK_SIZE,
+                        LLM_SUMMARY_WORKERS, QUESTION_TEXT_ELLIPSIS,
+                        QUESTION_TEXT_LIMIT, REDUNDANCY_WEIGHTS, RERANK_TOPK,
+                        RERANK_WEIGHT, RHO, ROLE_LABELS, ROLE_ORDER,
+                        ROLE_PRIORITY, ROLE_THRESHOLDS, SUMMARY_TEMPLATE,
+                        SUPPORT_SCORE_DECIMALS, TEXT_EMBED_BATCH_SIZE,
+                        TEXT_EMBED_MAX_LENGTH, TEXT_EMBED_MODEL_NAME,
+                        TEXT_RERANK_BATCH_SIZE, TEXT_RERANK_MAX_LENGTH,
+                        TEXT_RERANK_MODEL_NAME, USE_QWEN_RERANKER,
+                        WEIGHT_STAGE1, WEIGHT_STAGE2)
+from .io_utils import (atomic_save_text, ensure_dir, format_float,
+                       load_problem_records, load_student_sequences,
+                       pick_device, write_json)
+from .llm_summary_signatures import (LLM_SUMMARY_SIGNATURE_PREFIX,
+                                     llm_summary_signature_key,
+                                     summarize_llm_record,
+                                     summarize_llm_records_batch)
+from .llm_utils import (OpenAICompatibleSummarizer,
+                        append_summary_cache_entries, load_json_cache,
+                        load_summary_cache, parse_llm_summary_json,
+                        summary_cache_key)
 from .models import load_strict_prior_model
 from .retrieval_models import QwenEmbeddingEncoder, QwenReranker
-
 
 JSON_COLLAB_NEIGHBOR_WEIGHT = 0.35
 COLLAB_ISOLATED_GATE_WEIGHT = 0.35
@@ -86,6 +60,8 @@ COLLAB_PEER_GATE_THRESHOLD = 0.65
 
 @dataclass
 class Stage34Result:
+    """Stage 3.4 输出文件、运行模式和关键参数的清单。"""
+
     contexts_path: str
     preview_path: str
     embeddings_path: Optional[str]
@@ -108,6 +84,7 @@ class Stage34Result:
     context_shard_index: int
     context_num_shards: int
     merge_context_shards: bool
+    llm_summary_compact_prompt: bool = False
     mode: str = "contexts"
     warmup_stats: Optional[Dict[str, Any]] = None
 
@@ -164,6 +141,8 @@ def _role_from_candidate(candidate: Dict[str, Any]) -> str:
 
 
 class GraphAccessor:
+    """把 Stage 3.2 的知识图整理为适合候选打分的快速查询结构。"""
+
     def __init__(self, graph_bundle: Dict[str, Any]) -> None:
         self.concept_neighbors = {
             str(concept): set(neighbors)
@@ -184,6 +163,7 @@ class GraphAccessor:
         return list(self.problem_neighbor_concepts.get(pid, []))
 
     def structural_bonus(self, concepts_i: Sequence[str], concepts_t: Sequence[str]) -> float:
+        """返回历史知识点与目标知识点之间的前置/邻接结构奖励。"""
         best = 0.0
         target_set = set(concepts_t)
         for concept_i in concepts_i:
@@ -201,6 +181,7 @@ def _dtc(
     hist_i: int,
     eqsem_norm: np.ndarray,
 ) -> float:
+    """计算从某条历史到目标之间累积的语义变化距离。"""
     value = 1.0
     qt_vec = eqsem_norm[seq_problem_indices[current_t]]
     for j in range(hist_i + 1, current_t):
@@ -214,6 +195,7 @@ def _dtc_values(
     current_t: int,
     eq_cos_matrix: np.ndarray,
 ) -> np.ndarray:
+    """向量化计算目标之前所有历史位置的语义变化距离。"""
     if current_t <= 0:
         return np.zeros((0,), dtype=np.float32)
     one_minus = 1.0 - np.clip(eq_cos_matrix[:current_t, current_t], -1.0, 1.0)
@@ -232,6 +214,11 @@ def _build_sequence_cache(
     graph_accessor: GraphAccessor,
     problem_catalog: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
+    """预计算一个学生序列内反复使用的两两相似度和图结构特征。
+
+    缓存包括题目语义余弦、协同相似度、知识点 Jaccard、知识重合列表和图奖励，
+    避免为序列中的每个目标重复进行相同计算。
+    """
     seq_indices = np.asarray(seq_problem_indices, dtype=np.int64)
     seq_levels_arr = np.asarray(seq_levels, dtype=np.int32)
     seq_pids = [pid_lookup[int(idx)] for idx in seq_indices.tolist()]
@@ -311,6 +298,11 @@ def _compute_dynamic_prior(
     model: Any,
     device: str,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
+    """根据目标之前的历史计算学生动态状态及目标答对先验概率。
+
+    历史权重同时考虑题目语义相似度、认知层级差和时间距离；加权历史 ``z``
+    经 Stage 3.2 训练的 dynamic 网络得到动态状态 ``d_vec``。
+    """
     history_start = max(0, target_t - HISTORY_WINDOW)
     hist_positions = list(range(history_start, target_t))
     if not hist_positions:
@@ -371,6 +363,7 @@ def _history_diag_probs(
     model: Any,
     device: str,
 ) -> np.ndarray:
+    """在当前动态学生状态下，估计每道历史题的诊断答对概率。"""
     if not hist_problem_indices:
         return np.zeros((0,), dtype=np.float32)
     eq_batch = torch.tensor(eqsem[list(hist_problem_indices)], dtype=torch.float32, device=device)
@@ -394,6 +387,17 @@ def _candidate_scores(
     dtc_value: float,
     seq_cache: Dict[str, Any],
 ) -> Dict[str, Any]:
+    """计算一条历史交互对当前目标的多路证据分数。
+
+    主要分量：
+    - ``Ki``：知识点重合；
+    - ``pre/peer/high``：低阶前置、同阶迁移、高阶反馈关系；
+    - ``semantic``：无显式知识关系时的语义同类关系；
+    - ``graph/collab``：知识图和协同信号；
+    - ``Ti``：随语义变化距离衰减的时间权重。
+
+    ``Ri`` 用于第一阶段召回，``Ui`` 用于第二阶段选择。
+    """
     pid_i = pid_lookup[seq_problem_indices[hist_pos]]
     pid_t = pid_lookup[seq_problem_indices[current_t]]
     meta_i = problem_catalog[pid_i]
@@ -509,6 +513,7 @@ def _redundancy(
     pid_to_idx: Dict[str, int],
     catalog: Dict[str, Dict[str, Any]],
 ) -> float:
+    """衡量候选与已选证据的重复程度，避免最终证据表达相同信息。"""
     if not selected:
         return 0.0
     pid_i = candidate["problem_id"]
@@ -535,6 +540,7 @@ def _coverage_gain(
     graph_accessor: GraphAccessor,
     catalog: Dict[str, Dict[str, Any]],
 ) -> float:
+    """衡量候选新增的关系角色、知识点和图邻居覆盖量。"""
     target_concepts = catalog[target_pid]["concepts"]
     target_neighbor_set = set(graph_accessor.problem_neighbors(target_pid))
     covered_roles = {role: 0 for role in ROLE_ORDER}
@@ -562,6 +568,7 @@ def _coverage_gain(
 
 
 def _dominant_role(selected: Sequence[Dict[str, Any]]) -> str:
+    """汇总最终证据，确定最主要的认知关系角色。"""
     role_scores = {role: 0.0 for role in ROLE_ORDER}
     for candidate in selected:
         for role in ROLE_ORDER:
@@ -576,6 +583,7 @@ def _summary_fields(
     catalog: Dict[str, Dict[str, Any]],
     sdyn: float,
 ) -> Dict[str, Any]:
+    """根据已选证据和动态先验生成无需 LLM 的模板化认知摘要字段。"""
     target_concepts = catalog[target_pid]["concepts"]
     freq: Dict[str, int] = {concept: 0 for concept in target_concepts}
     for candidate in selected:
@@ -627,6 +635,7 @@ def _summary_fields(
 
 
 def _build_llm_context_text(llm_summary_text: str, main_context_text: str) -> str:
+    """将结构化 LLM 总结转为下游模型使用的自然语言 Context。"""
     parsed = parse_llm_summary_json(str(llm_summary_text or ""))
     parts: List[str] = []
     diagnosis = str(parsed.get("diagnosis") or "").strip()
@@ -649,6 +658,7 @@ def _build_llm_context_text(llm_summary_text: str, main_context_text: str) -> st
 
 
 def _build_llm_struct_texts(record: Dict[str, Any]) -> Dict[str, str]:
+    """拆分 LLM 结构化总结，分别编码掌握点、薄弱点、诊断和辅助描述。"""
     llm_summary_text = str(record.get("summary_fields", {}).get("llm_summary_text") or "").strip()
     parsed = parse_llm_summary_json(llm_summary_text)
     stable_text = "、".join(str(item.get("concept") or "").strip() for item in parsed["mastered_concepts"] if str(item.get("concept") or "").strip())
@@ -668,6 +678,7 @@ def _build_llm_struct_texts(record: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _build_llm_struct_feature_vector(record: Dict[str, Any]) -> np.ndarray:
+    """把 LLM 总结中的计数、风险和证据质量转为固定长度数值特征。"""
     llm_summary_text = str(record.get("summary_fields", {}).get("llm_summary_text") or "").strip()
     parsed = parse_llm_summary_json(llm_summary_text)
     mastered_points = [str(item.get("concept") or "").strip() for item in parsed["mastered_concepts"] if str(item.get("concept") or "").strip()]
@@ -691,6 +702,7 @@ def _build_llm_struct_feature_vector(record: Dict[str, Any]) -> np.ndarray:
 
 
 def _unique_texts_with_inverse(texts: Sequence[str]) -> Tuple[List[str], np.ndarray]:
+    """对重复文本去重，并记录恢复原顺序所需的反向索引。"""
     unique_texts: List[str] = []
     inverse_indices = np.zeros((len(texts),), dtype=np.int64)
     text_to_unique_idx: Dict[str, int] = {}
@@ -713,6 +725,7 @@ def _encode_dedup_texts_resumable(
     desc: str,
     cache_prefix: Path,
 ) -> np.ndarray:
+    """去重并可断点续跑地编码文本，最后恢复到原记录顺序。"""
     unique_texts, inverse_indices = _unique_texts_with_inverse(texts)
     total_count = len(texts)
     unique_count = len(unique_texts)
@@ -775,6 +788,7 @@ def _merge_context_shards(
     output_contexts_path: Path,
     output_preview_path: Path,
 ) -> int:
+    """按分片编号顺序合并 Context JSONL，并重新生成预览文件。"""
     shard_dir = contexts_dir / "shards"
     record_count = 0
     preview_lines: List[str] = []
@@ -809,6 +823,11 @@ def _build_context_embeddings(
     text_embed_batch_size: int,
     text_embed_max_length: int,
 ) -> Path:
+    """把 Context 文本与 LLM 结构字段编码为训练阶段读取的向量文件。
+
+    输出文件中的 ``index`` 与各向量矩阵严格按行对齐。文本会先去重并使用分块
+    缓存编码，以便大规模任务断点续跑。
+    """
     print("[stage34] loading text embedding model for context embeddings", flush=True)
     encoder = QwenEmbeddingEncoder(
         model_name_or_path=str(text_embed_model or TEXT_EMBED_MODEL_NAME),
@@ -962,7 +981,17 @@ def _enrich_contexts_with_llm_summary(
     llm_summary_chunk_size: int,
     llm_summary_batch_size: int,
     total_records_hint: Optional[int] = None,
+    output_contexts_path: Optional[Path] = None,
+    line_start: int = 0,
+    line_end: Optional[int] = None,
+    failure_path: Optional[Path] = None,
+    rewrite_summary_cache_at_end: bool = True,
 ) -> None:
+    """为已有 Context 追加严格校验的 LLM 结构化认知总结。
+
+    函数按块读取 JSONL，优先复用 prompt-signature 缓存；缺失项支持批量请求、
+    逐条回退、多线程和分片范围处理。任意无法解决的失败都会写入失败文件并报错。
+    """
     ensure_dir(cache_dir)
     cache_prefix = LLM_SUMMARY_SIGNATURE_PREFIX
 
@@ -974,27 +1003,46 @@ def _enrich_contexts_with_llm_summary(
         )
 
     llm_cache_path = cache_dir / "llm_summary_cache.jsonl"
-    llm_failure_path = cache_dir / "llm_summary_failures.jsonl"
+    llm_failure_path = failure_path or (cache_dir / "llm_summary_failures.jsonl")
     raw_llm_cache = load_summary_cache(llm_cache_path)
     llm_cache = {
         key: value
         for key, value in raw_llm_cache.items()
         if str(key).startswith(cache_prefix)
     }
-    temp_path = contexts_path.with_suffix(".llm.tmp")
+    # 分片范围使用 JSONL 物理行号，并采用左闭右开区间 [start_line, end_line)，
+    # 因此多个独立分片可以无重叠、无缺口地合并。
+    start_line = max(0, int(line_start or 0))
+    end_line = int(line_end) if line_end is not None else None
+    if end_line is not None and end_line < start_line:
+        raise ValueError(f"Invalid LLM summary line range: start={start_line} end={end_line}")
+    final_output_path = output_contexts_path
+    if final_output_path is None:
+        temp_path = contexts_path.with_suffix(".llm.tmp")
+    else:
+        final_output_path = Path(final_output_path)
+        ensure_dir(final_output_path.parent)
+        temp_path = final_output_path.with_suffix(final_output_path.suffix + ".tmp")
     workers = max(1, int(llm_summary_workers))
     chunk_size = max(workers, int(llm_summary_chunk_size))
     batch_size = max(1, int(llm_summary_batch_size))
     total_records = int(total_records_hint or 0)
+    if end_line is not None:
+        total_records = max(0, end_line - start_line)
     if total_records <= 0:
         with contexts_path.open("r", encoding="utf-8", errors="replace") as probe_f:
-            for line in probe_f:
+            for line_no, line in enumerate(probe_f):
+                if line_no < start_line:
+                    continue
+                if end_line is not None and line_no >= end_line:
+                    break
                 if line.strip():
                     total_records += 1
     print(
         f"[stage34] llm summary start total_records={total_records} "
         f"workers={workers} chunk_size={chunk_size} batch_size={batch_size} "
-        f"cache_scope=prompt-signature "
+        f"cache_scope=prompt-signature compact_prompt={bool(getattr(summarizer, 'compact_prompt', False))} "
+        f"line_start={start_line} line_end={end_line if end_line is not None else 'EOF'} "
         f"semantic_cache_entries={len(llm_cache)} raw_cache_entries={len(raw_llm_cache)}",
         flush=True,
     )
@@ -1052,6 +1100,8 @@ def _enrich_contexts_with_llm_summary(
             legacy_summary_text = str(raw_llm_cache.get(key, "") or "").strip()
             existing_summary_text = str(record.get("summary_fields", {}).get("llm_summary_text") or "").strip()
             existing_llm_context_text = str(record.get("llm_context_text") or "").strip()
+            # 缓存优先级：精确 prompt 签名 > 旧版交互键 > Context 中已有总结。
+            # 后两者特异性较低，仅作为兼容和恢复手段。
             cache_candidates = [
                 ("signature", signature_summary_text),
                 ("legacy", legacy_summary_text),
@@ -1091,6 +1141,7 @@ def _enrich_contexts_with_llm_summary(
                 missing_items.append((idx, key, record))
 
         if missing_items:
+            # 相同 prompt 签名对应完全相同的请求；块内只请求一次，再复用给重复记录。
             signature_owner: Dict[str, Tuple[int, str, Dict[str, Any]]] = {}
             duplicate_items: List[Tuple[int, str, str, Dict[str, Any]]] = []
             for idx, key, record in missing_items:
@@ -1133,6 +1184,7 @@ def _enrich_contexts_with_llm_summary(
                         results.append((idx, key, record, batch_summaries[f"case_{pos}"]))
                     return results, 1, 0, []
                 except Exception:
+                    # 批量响应格式错误时逐条重试，避免一个坏样本导致整批结果丢失。
                     results = []
                     failures_local = []
                     for idx, key, record in batch_items:
@@ -1221,7 +1273,11 @@ def _enrich_contexts_with_llm_summary(
             chunk_records: List[Dict[str, Any]] = []
             progress = tqdm(total=total_records, desc="strict llm summaries")
             try:
-                for line in src:
+                for line_no, line in enumerate(src):
+                    if line_no < start_line:
+                        continue
+                    if end_line is not None and line_no >= end_line:
+                        break
                     if not line.strip():
                         continue
                     chunk_records.append(json.loads(line))
@@ -1240,9 +1296,15 @@ def _enrich_contexts_with_llm_summary(
         if executor is not None:
             executor.shutdown(wait=True)
 
-    contexts_path.unlink(missing_ok=True)
-    temp_path.replace(contexts_path)
-    _rewrite_summary_cache()
+    # 原地模式仅在处理成功后替换源文件；分片模式写入独立文件，不修改共享源 JSONL。
+    if final_output_path is None:
+        contexts_path.unlink(missing_ok=True)
+        temp_path.replace(contexts_path)
+    else:
+        temp_path.replace(final_output_path)
+    # 并发分片会共同追加缓存；只有单一所有者可以压缩重写，否则可能覆盖其他分片结果。
+    if rewrite_summary_cache_at_end:
+        _rewrite_summary_cache()
     print(
         "[stage34] llm summary runtime stats "
         + json.dumps(runtime_stats, ensure_ascii=False, sort_keys=True),
@@ -1268,6 +1330,7 @@ def _reranker_score_cache_key(
     hist_pid: str,
     answer_result: str = "",
 ) -> str:
+    """根据缓存作用域构造 reranker 分数键。"""
     scope = str(cache_scope or "pair_result").strip().lower()
     if scope == "pair":
         return f"pair\t{target_pid}\t{hist_pid}"
@@ -1339,6 +1402,7 @@ def _apply_qwen_reranker(
     rerank_weight: float,
     rerank_cache_scope: str,
 ) -> None:
+    """对第一阶段候选执行语义重排，并把 rerank 分数加入 ``Ui``。"""
     if not stage1_candidates:
         return
     query = _reranker_query_text(target_meta)
@@ -1462,6 +1526,10 @@ def _precompute_reranker_cache(
     context_shard_index: int,
     context_num_shards: int,
 ) -> Dict[str, Any]:
+    """预扫描全部第一阶段候选并批量填充 reranker 缓存。
+
+    待评分任务先持久化到 SQLite，评分成功后删除，因此任务可中断后继续。
+    """
     if rerank_cache_scope == "interaction":
         raise ValueError("Rerank cache warmup is only useful for pair_result or pair scope, not interaction scope")
 
@@ -1679,6 +1747,7 @@ def _precompute_reranker_cache(
 
 
 def _evidence_record(candidate: Dict[str, Any], rank: int, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """把内部候选分数整理为可保存、可展示、可供 LLM 使用的证据记录。"""
     pid = candidate["problem_id"]
     role_key = _role_from_candidate(candidate)
     overlap = candidate["knowledge_overlap_concepts"]
@@ -1743,6 +1812,7 @@ def run_stage34(
     llm_temperature: float = 0.1,
     llm_disable_thinking: bool = False,
     llm_use_chat_template_kwargs: bool = False,
+    llm_summary_compact_prompt: bool = False,
     llm_summary_workers: int = LLM_SUMMARY_WORKERS,
     llm_summary_chunk_size: int = LLM_SUMMARY_CHUNK_SIZE,
     llm_summary_batch_size: int = 1,
@@ -1751,6 +1821,11 @@ def run_stage34(
     context_num_shards: int = 1,
     merge_context_shards: bool = False,
 ) -> Stage34Result:
+    """执行完整 Stage 3.4 Context 构建流程。
+
+    支持四类运行方式：普通生成、按学生分片生成、合并分片、复用已有 Context；
+    还可单独预热 reranker 缓存。普通流程完成后可继续添加 LLM 总结并编码向量。
+    """
     ensure_dir(contexts_dir)
     ensure_dir(reports_dir)
     ensure_dir(cache_dir)
@@ -1773,6 +1848,7 @@ def run_stage34(
     if rerank_cache_scope not in {"pair_result", "pair", "interaction"}:
         raise ValueError("--rerank_cache_scope must be one of: pair_result, pair, interaction")
 
+    # 初始化题目目录、分片路径以及可选 reranker/LLM 客户端。
     problem_catalog_records: Dict[str, Dict[str, Any]] = {}
     with (priors_dir / "problem_catalog.jsonl").open("r", encoding="utf-8") as f:
         for line in f:
@@ -1821,8 +1897,10 @@ def run_stage34(
             temperature=float(llm_temperature),
             disable_thinking=bool(llm_disable_thinking),
             use_chat_template_kwargs=bool(llm_use_chat_template_kwargs),
+            compact_prompt=bool(llm_summary_compact_prompt),
         )
 
+    # 缓存预热模式只计算并保存 reranker 分数，不生成 Context。
     if rerank_cache_warmup_only:
         if reranker is None:
             raise ValueError("--rerank_cache_warmup_only requires Qwen reranker to be enabled")
@@ -1865,12 +1943,14 @@ def run_stage34(
             context_shard_index=context_shard_index,
             context_num_shards=context_num_shards,
             merge_context_shards=False,
+            llm_summary_compact_prompt=bool(llm_summary_compact_prompt),
             mode="rerank_cache_warmup",
             warmup_stats=warmup_stats,
         )
         write_json(asdict(result), Path(result.manifest_path))
         return result
 
+    # 合并模式负责拼接已完成分片，之后再统一执行 LLM 总结和向量编码。
     if merge_context_shards:
         record_count = _merge_context_shards(
             contexts_dir=contexts_dir,
@@ -1924,10 +2004,12 @@ def run_stage34(
             context_shard_index=context_shard_index,
             context_num_shards=context_num_shards,
             merge_context_shards=True,
+            llm_summary_compact_prompt=bool(llm_summary_compact_prompt),
         )
         write_json(asdict(result), Path(result.manifest_path))
         return result
 
+    # 复用模式跳过证据检索；普通/分片模式则从学生历史重新生成 Context JSONL。
     if reuse_existing_contexts:
         if not contexts_path.exists():
             raise FileNotFoundError(f"--reuse_existing_contexts was set but {contexts_path} does not exist")
@@ -1997,6 +2079,7 @@ def run_stage34(
                     problem_catalog_records,
                 )
 
+                # 每个目标只能使用其之前的交互。先计算动态先验，再对有限历史窗口打分。
                 for target_t in range(1, len(seq_problem_indices)):
                     target_pid = pid_lookup[seq_problem_indices[target_t]]
                     _z, d_vec, sdyn = _compute_dynamic_prior(
@@ -2031,6 +2114,7 @@ def run_stage34(
                         )
                         candidates.append(candidate)
 
+                    # 第一阶段按带时间衰减的 Ri 召回候选，可选 reranker 只作用于召回结果。
                     candidates.sort(key=lambda item: (item["Ri"], item["history_pos"]), reverse=True)
                     stage1_candidates = candidates[: min(int(rerank_topk), K1_DEFAULT, len(candidates))]
                     if reranker is not None and stage1_candidates:
@@ -2048,6 +2132,7 @@ def run_stage34(
                             rerank_cache_scope=rerank_cache_scope,
                         )
 
+                    # 第二阶段先选 Ui 最高证据，再迭代加入“高支持、增覆盖、低冗余”的证据。
                     selected: List[Dict[str, Any]] = []
                     remaining = list(stage1_candidates)
                     if remaining:
@@ -2072,6 +2157,7 @@ def run_stage34(
                         selected.append(best_item)
                         remaining.remove(best_item)
 
+                    # 将选中证据同时保存为结构化列表、纯证据文本和模板增强文本。
                     evidence_list = [_evidence_record(candidate, rank, problem_catalog_records) for rank, candidate in enumerate(selected, start=1)]
                     summary_fields = _summary_fields(target_pid, selected, problem_catalog_records, sdyn)
                     main_context_text = "\n".join(evidence["text"] for evidence in evidence_list).strip()
@@ -2107,6 +2193,7 @@ def run_stage34(
 
         atomic_save_text("\n\n".join(preview_lines), preview_path)
 
+    # LLM 总结和最终向量编码只在非分片输出上执行，确保每条记录只处理一次。
     if (not shard_mode) and summarizer is not None:
         _enrich_contexts_with_llm_summary(
             contexts_path=contexts_path,
@@ -2153,6 +2240,7 @@ def run_stage34(
         context_shard_index=context_shard_index,
         context_num_shards=context_num_shards,
         merge_context_shards=False,
+        llm_summary_compact_prompt=bool(llm_summary_compact_prompt),
     )
     write_json(asdict(result), Path(result.manifest_path))
     return result

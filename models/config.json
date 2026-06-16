@@ -34,6 +34,105 @@
         "num_attn_heads": 5,
         "dropout": 0.6
     },
+    "akt": {
+        "d_model": 100,
+        "n_blocks": 1,
+        "dropout": 0.2,
+        "d_ff": 256,
+        "kq_same": 1,
+        "final_fc_dim": 512,
+        "num_attn_heads": 5,
+        "separate_qa": false,
+        "l2": 0.00001
+    },
+    "dimkt": {
+        "emb_size": 100,
+        "dropout": 0.2,
+        "difficult_levels": 10
+    },
+    "qikt": {
+        "emb_size": 100,
+        "dropout": 0.2
+    },
+    "tckt": {
+        "d_model": 100,
+        "num_attn_heads": 5,
+        "dropout": 0.2,
+        "max_seq_len": 512
+    },
+    "simplekt": {
+        "d_model": 100,
+        "n_blocks": 1,
+        "dropout": 0.2,
+        "d_ff": 256,
+        "kq_same": 1,
+        "final_fc_dim": 512,
+        "final_fc_dim2": 256,
+        "num_attn_heads": 5,
+        "separate_qa": false,
+        "l2": 0.00001,
+        "max_seq_len": 512
+    },
+    "sparsekt": {
+        "d_model": 100,
+        "n_blocks": 1,
+        "dropout": 0.2,
+        "d_ff": 256,
+        "kq_same": 1,
+        "final_fc_dim": 512,
+        "final_fc_dim2": 256,
+        "num_attn_heads": 5,
+        "separate_qa": false,
+        "l2": 0.00001,
+        "max_seq_len": 512,
+        "sparse_ratio": 0.8,
+        "k_index": 5,
+        "stride": 1
+    },
+    "robustkt": {
+        "d_model": 100,
+        "n_blocks": 1,
+        "dropout": 0.2,
+        "ks": 5,
+        "d_ff": 256,
+        "kq_same": 1,
+        "final_fc_dim": 512,
+        "num_attn_heads": 5,
+        "separate_qa": false,
+        "l2": 0.00001
+    },
+    "denoisekt": {
+        "d_model": 100,
+        "n_blocks": 1,
+        "dropout": 0.2,
+        "dropout1": 0.1,
+        "bf": 0.9,
+        "d_ff": 256,
+        "kq_same": 1,
+        "final_fc_dim": 512,
+        "final_fc_dim2": 256,
+        "num_attn_heads": 5,
+        "max_seq_len": 512
+    },
+    "keenkt": {
+        "learning_rate": 0.0001,
+        "weight_decay": 0.00001,
+        "d_model": 256,
+        "n_blocks": 4,
+        "dropout": 0.2,
+        "d_ff": 512,
+        "num_attn_heads": 8,
+        "final_fc_dim": 256,
+        "final_fc_dim2": 256,
+        "max_seq_len": 512,
+        "separate_qa": false,
+        "use_diffusion": true,
+        "diffusion_weight": 0.08,
+        "noise_level": 0.3,
+        "use_cl": true,
+        "cl_weight": 0.02,
+        "se_ratio": 16
+    },
     "gkt": {
         "hidden_size": 30,
         "num_attn_heads": 2,

@@ -34,6 +34,11 @@ def main() -> None:
     parser.add_argument("--llm_model", type=str, default="Qwen3-8B")
     parser.add_argument("--llm_max_tokens", type=int, default=256)
     parser.add_argument("--llm_temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--llm_summary_compact_prompt",
+        action="store_true",
+        help="Use compact LLM summary prompts without activation/raw_scores debug JSON.",
+    )
     parser.add_argument("--progress_every", type=int, default=500000)
     args = parser.parse_args()
 
@@ -55,6 +60,7 @@ def main() -> None:
         timeout_sec=1,
         max_tokens=args.llm_max_tokens,
         temperature=args.llm_temperature,
+        compact_prompt=bool(args.llm_summary_compact_prompt),
     )
 
     rows = 0

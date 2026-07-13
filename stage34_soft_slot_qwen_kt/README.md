@@ -1,1041 +1,332 @@
-# Stage34 Soft-Slot Qwen KT 全流程说明
+# Stage3.4 Soft-Slot Qwen KT：设计与代码说明
 
-本文档面向没有上下文的读者或后续 LLM。它说明从原始数据、Stage3.2、Stage3.4，到 Soft-Slot Qwen Knowledge Tracing 训练、评估和消融的完整链路。
+`stage34_soft_slot_qwen_kt/` 是当前主实验目录。它接收 Stage3.2 的题目侧先验和 Stage3.4 的学生认知上下文，通过可训练 projector 将两类外部特征变成 Qwen embedding 空间中的 soft tokens，再由冻结的 Qwen 完成知识追踪二分类。
 
-本模块是独立实验模块，位于：
+本文档面向需要阅读、维护或扩展代码的人，重点解释模块边界、数据流和设计选择，不把 README 写成环境配置或逐命令复现手册。
+
+## 1. 一句话理解主方法
 
 ```text
-stage34_soft_slot_qwen_kt/
+先从学生历史中找出“对当前题真正有用的证据”，
+再把学生状态和当前题先验分别压缩成 soft slots，
+最后让冻结 Qwen 判断本次作答更可能正确还是错误。
 ```
 
-它不修改，也不依赖 DKT/SAKT/SAINT/AKT 等 KT baseline 的最终推理逻辑。KT baseline 可以作为结果对照，但不参与本方法推理。
+对应的任务是估计：
 
-## 1. 方法概览
+```text
+P(y_t = 1 | H_<t, q_t)
+```
 
-目标：使用 Stage3.2 和 Stage3.4 已构造的学生认知状态、历史证据和目标题先验，通过 soft slots 输入冻结的 Qwen3-8B，预测学生答对目标题的概率。
+其中 `H_<t` 是当前目标之前的学生交互历史，`q_t` 是目标题。本方法不把整段历史原样交给 LLM，而是先构造目标条件化的认知上下文。
 
-整体流程：
+## 2. 端到端数据流
 
 ```text
 problem.json + student-problem-fine.json
-        |
-        v
-Stage3.2: 题目先验、语义向量、协同向量、动态先验模型
-        |
-        v
-Stage3.4: 针对每个预测目标构造学生历史证据、认知摘要、context embeddings
-        |
-        v
-Soft-Slot Feature Store: 对齐 Stage3.2/3.4 产物，生成可训练样本和 memmap 特征
-        |
-        v
-Frozen Qwen3-8B + trainable projectors
-        |
-        v
-A/B logits -> softmax -> P(correct)
-```
-
-核心设计：
-
-- Qwen3-8B 冻结，不微调。
-- 只训练 Context projector 和 Target projector。
-- 使用 `inputs_embeds`，把投影后的 embedding 替换 prompt 中的 slot 位置。
-- 不让 Qwen 自由生成 JSON 或概率。
-- 读取标签 token `A=正确`、`B=错误` 的 logits，用二分类 softmax 得到答对概率。
-
-一句话版本：
-
-```text
-把 Stage3.4 学生状态和 Stage3.2 目标题先验翻译成 Qwen token embedding 空间里的 soft tokens，再让冻结 Qwen 判断“正确/错误”。
-```
-
-## 2. 与 A-LLMRec 的关系
-
-本方法借鉴 A-LLMRec Figure 2(c) Stage 2 的思想：
-
-```text
-外部 embedding -> projector -> LLM token space -> 插入自然语言 prompt -> 冻结 LLM 推理
-```
-
-对应关系：
-
-```text
-A-LLMRec:
-  user/item embedding -> projector -> LLM token space -> 推荐 item title
-
-本方法:
-  学生状态/目标题 embedding -> projector -> Qwen token space -> 正确/错误二分类
-```
-
-本方法不是完整复现 A-LLMRec：
-
-- 不使用 SASRec 或推荐系统 CF backbone。
-- 不复现 A-LLMRec Stage 1。
-- 不通过 OpenAI `/chat/completions` 文本接口传 soft slots。
-- 不让 Qwen 生成自然语言概率。
-
-## 3. 目录和文件边界
-
-主要入口：
-
-```text
-stage34_soft_slot_qwen_kt/scripts/prepare_soft_slot_embeddings.py
-stage34_soft_slot_qwen_kt/scripts/train_soft_slot_kt.py
-stage34_soft_slot_qwen_kt/scripts/infer_soft_slot_kt.py
-stage34_soft_slot_qwen_kt/scripts/select_and_evaluate_soft_slot_kt.py
-```
-
-核心代码：
-
-```text
-stage34_soft_slot_qwen_kt/soft_slot_kt/
-```
-
-本模块输出：
-
-```text
-stage34_soft_slot_qwen_kt/artifacts/     # Soft-Slot feature store
-stage34_soft_slot_qwen_kt/checkpoints/   # projector checkpoints
-stage34_soft_slot_qwen_kt/results/       # metrics and predictions
-stage34_soft_slot_qwen_kt/logs/          # optional logs
-```
-
-不要把服务器上的以下目录用 `rsync --delete` 删除：
-
-```text
-artifacts/
-checkpoints/
-results/
-logs/
-```
-
-## 4. 数据集
-
-服务器工作目录：
-
-```bash
-cd /home/xiaoyao/code/Work4.1
-```
-
-| Dataset | problem | student | Stage3.2/3.4 root | Soft-Slot feature dir |
-|---|---|---|---|---|
-| MoocRadar | `datalocal/problem.json` | `datalocal/student-problem-fine.json` | `out/strict_common_pipeline` | `stage34_soft_slot_qwen_kt/artifacts/moocradar/features` |
-| XES3G5M | `datalocal/xes3g5m_strict_core20/problem.json` | `datalocal/xes3g5m_strict_core20/student-problem-fine.json` | `out/xes3g5m_strict_core20_common_pipeline` | `stage34_soft_slot_qwen_kt/artifacts/xes3g5m/features` |
-| FoundationalASSIST | `datalocal/foundationalassist_text_only_core200_contextcomplete/problem.json` | `datalocal/foundationalassist_text_only_core200_contextcomplete/student-problem-fine.json` | `out/foundationalassist_text_only_core200_contextcomplete_common_pipeline` | `stage34_soft_slot_qwen_kt/artifacts/foundationalassist/features` |
-
-统一实验划分：
-
-```text
-split_mode=new_concept
-test_concept_ratio=0.8
-valid_concept_ratio=0.0
-valid_ratio=0.0
-validation disabled
-seed=42
-```
-
-## 5. 输入数据格式
-
-### problem.json
-
-题目目录。每道题至少应包含：
-
-```text
-problem_id
-text/title
-concepts
-cognitive_dimension
-```
-
-`cognitive_dimension` 是题目认知层级标签，不等同于 XES3G5M 的官方 `question_level`。
-
-### student-problem-fine.json
-
-学生交互序列。每条交互至少应包含：
-
-```text
-problem_id
-is_correct
-```
-
-Stage3.4 会按照学生序列为每个预测目标构造上下文。Soft-Slot feature store 会根据 `(user_id, target_t, target_pid)` 找回真实标签，但标签只保存在样本的 `label` 字段中，不作为 prompt 或 embedding 输入。
-
-## 6. Stage3.2: 题目先验构造
-
-Stage3.2 位于：
-
-```text
+        │
+        ▼
 scripts/common_pipeline_strict/stage32.py
-```
-
-运行入口：
-
-```text
-scripts/run_common_cognitive_pipeline_strict.py
-```
-
-Stage3.2 的作用是把题目元数据和学生交互历史转换为可复用的题目侧先验。
-
-主要输出位于：
-
-```text
-<out_root>/priors/
-```
-
-关键产物：
-
-| 文件 | 用途 |
-|---|---|
-| `stage32_manifest.json` | Stage3.2 产物清单 |
-| `problem_catalog.jsonl` | Stage3.4 和 Soft-Slot 使用的统一题目目录 |
-| `hqtext_vectors.pkl` | 题目文本语义向量 |
-| `hqid_vectors.pkl` | 分层语义 ID 向量 |
-| `eqbase_vectors.pkl` | 题目基础认知向量 |
-| `semantic_vectors.pkl` | 加入 Rasch/认知方向修正后的语义向量 |
-| `item_collaborative_embeddings.pkl` | 基于学生行为的题目协同向量 |
-| `item_collaborative.json` | 题目协同邻居 |
-| `problem_mu_q.json` | Rasch 题目难度/能力相关先验 |
-| `concept_graph_bundle.json` | 知识图和概念关系 |
-| `model_state.pt` | Stage3.2 动态先验模型参数 |
-| `training_report.json` | Stage3.2 训练报告 |
-| `implementation_defaults.json` | 生成参数记录 |
-
-本方法中，Stage3.2 主要进入 Target Slot：
-
-```text
-hqtext
-hqid
-semantic
-collaborative
-```
-
-其中：
-
-- `hqtext` 来自 `hqtext_vectors.pkl`
-- `hqid` 来自 `hqid_vectors.pkl`
-- `semantic` 来自 `semantic_vectors.pkl`
-- `collaborative` 来自 `item_collaborative_embeddings.pkl`
-
-## 7. Stage3.4: 学生上下文构造
-
-Stage3.4 位于：
-
-```text
+        │  题目文本、分层语义 ID、认知语义、协同表示、知识图、动态先验
+        ▼
 scripts/common_pipeline_strict/stage34.py
+        │  目标条件化证据列表、模板摘要、结构化认知总结、context embeddings
+        ▼
+scripts/prepare_soft_slot_embeddings.py
+        │  对齐样本并物化 Context/Target 特征数组
+        ▼
+soft_slot_kt/data.py
+        │  读取样本、拼接特征、构造 prompt 与 slot masks
+        ▼
+soft_slot_kt/model.py
+        │  Context/Target projector → inputs_embeds → frozen Qwen
+        ▼
+logit(A=正确), logit(B=错误)
+        │
+        ▼
+P(correct) + 监督损失 + 评估指标
 ```
 
-Stage3.4 读取 Stage3.2 的题目先验，为每个预测目标构造学生历史证据和认知状态。
+主实验目录只负责 Feature Store 之后的桥接、建模和评估。Stage3.2/Stage3.4 位于仓库上层，是主实验的上游特征构造模块。
 
-主要输出位于：
+## 3. 为什么采用这套方案
+
+### 3.1 先检索再预测
+
+学生历史中同时包含相关、重复和无关交互。直接拼接完整历史会把证据选择问题交给 LLM，也会增加输入长度和噪声。本项目先以目标题为条件选择少量互补证据，再生成学生状态表示。
+
+### 3.2 区分“学生状态”和“目标题要求”
+
+同一个学生面对不同目标题时，相关历史和风险判断都可能不同。因此代码使用两组独立输入：
+
+- Context Slot 表示当前目标题下的学生认知状态；
+- Target Slot 表示目标题自身的语义、认知层级和协同先验。
+
+两组特征使用独立 projector，避免把“学生会什么”和“题目要求什么”在输入端混为一个向量。
+
+### 3.3 冻结 Qwen，只学习接口
+
+上游特征与 Qwen token embeddings 不在同一表示空间。`SoftSlotProjector` 学习的是两者之间的映射，而不是重新训练 Qwen 的语言能力。这样可以把训练目标集中在“如何把认知证据组织成 LLM 可消费的连续表示”。
+
+### 3.4 用标签 logits 做概率预测
+
+知识追踪需要稳定的概率输出，不需要自然语言生成。代码读取正确/错误候选标签的分数并做二分类 softmax，从而直接得到 `P(correct)`。
+
+## 4. 上游认知信息如何形成
+
+### 4.1 Stage3.2：题目侧表示
+
+实现文件：`../scripts/common_pipeline_strict/stage32.py`。
+
+Stage3.2 将题目元数据和学生行为统计转换为题目级先验。与 Soft-Slot 主配置直接相连的字段如下：
+
+| Feature Store 字段 | Stage3.2 来源 | 表达内容 |
+|---|---|---|
+| `hqtext` | `hqtext_vectors.pkl` | 题目文本语义 |
+| `hqid` | `hqid_vectors.pkl` | 分层语义 ID |
+| `semantic` | `semantic_vectors.pkl` | 加入认知/难度修正后的题目表示 |
+| `collaborative` | `item_collaborative_embeddings.pkl` | 基于学生行为关系的题目协同表示 |
+
+Stage3.2 还生成 `concept_graph_bundle.json`、题目难度和动态先验模型等产物，供 Stage3.4 构造目标相关证据。
+
+### 4.2 Stage3.4：目标条件化证据选择
+
+实现文件：`../scripts/common_pipeline_strict/stage34.py`。
+
+对每个 `(user_id, target_t, target_pid)`，Stage3.4 只考虑 `target_t` 之前的历史交互。候选评分综合：
+
+- 目标题与历史题的知识点重合；
+- 低阶前置、同阶迁移、高阶反馈等认知层级关系；
+- 题目语义相似度；
+- 知识图关系；
+- 协同相似度；
+- 随语义变化距离衰减的时间权重；
+- 学生历史正确性和动态先验状态。
+
+第一阶段按目标相关性召回候选，并可叠加 reranker 分数。第二阶段先取支持度最高的证据，再迭代优化：
 
 ```text
-<out_root>/contexts/
-<out_root>/cache/
+最终选择分数 = 支持度 + 覆盖增益 - 冗余惩罚
 ```
 
-关键产物：
+覆盖增益关注认知角色、知识点和图邻居是否带来新信息；冗余惩罚抑制知识、角色和语义高度重复的证据。
 
-| 文件 | 用途 |
-|---|---|
-| `contexts/stage34_manifest.json` | Stage3.4 产物清单 |
-| `contexts/contexts.jsonl` | 每个预测目标的文本上下文、摘要和证据列表 |
-| `cache/context_embeddings.pkl` | Stage3.4 context embedding 矩阵 |
+这部分是使用预计算表示与固定权重的启发式检索，不是随 Soft-Slot projector 一起训练的端到端检索器。
 
-`contexts.jsonl` 每行对应一个预测目标，典型字段：
+### 4.3 知识图的实际边界
 
-```text
-user_id
-target_t
-target_pid
-target_semantic_id
-stage1_candidate_count
-selected_count
-main_context_text
-template_context_text
-llm_context_text
-summary_fields
-evidence_list
-```
+Stage3.4 只读取一个图源：`concept_graph_bundle.json`。同一张图在两个位置发挥作用：
 
-`summary_fields` 典型字段：
+1. 候选评分中的结构关系增益；
+2. 第二阶段选择中的图邻居覆盖增益。
+
+因此，代码不是三个彼此独立的“召回图、重排图、覆盖图”模块。
+
+### 4.4 结构化认知总结
+
+Stage3.4 先根据证据生成模板状态字段；启用 LLM 总结时，再要求总结模型严格输出：
 
 ```text
-target_concepts
-dominant_role
-recent_trend
+mastered_concepts
+weak_concepts
+transfer_state
 risk_level
-sdyn
-summary_text
-llm_summary_text
-llm_summary_struct
+evidence_quality
+diagnosis
 ```
 
-`context_embeddings.pkl` 典型字段：
+这些字段被转换为三类可供主实验使用的信息：
+
+- `llm_embeddings`：结构化总结与证据上下文形成的文本表示；
+- `llm_struct_features`：掌握/薄弱点数量、存在性、诊断长度、风险等级和证据质量等显式结构特征；
+- `stage34_numeric`：`sdyn`、候选数量和最终证据数量等数值状态。
+
+总结阶段只负责把证据压缩为认知状态。最终 `P(correct)` 由后续 Soft-Slot Qwen 计算，不由总结模型生成。
+
+## 5. Feature Store：模块之间的数据契约
+
+入口脚本 `scripts/prepare_soft_slot_embeddings.py` 调用 `soft_slot_kt/prepare.py`。它将上游产物转成按行读取的统一特征库。
+
+### 5.1 样本身份对齐
+
+每个预测样本使用三元组标识：
 
 ```text
-index
-main_embeddings
-template_embeddings
-llm_embeddings
-llm_struct_embeddings
-llm_struct_features
+(user_id, target_t, target_pid)
 ```
 
-本方法主实验使用 Stage3.4 的：
+准备阶段逐行核对 `contexts.jsonl` 和 `context_embeddings.pkl[index]` 的三元组。如果顺序或身份不一致，代码直接报错，避免把学生状态错配到另一道题。
 
-```text
-llm_embeddings
-llm_struct_features
-stage34_numeric
-```
+### 5.2 Feature Store 主要文件
 
-其中 `stage34_numeric` 由 Soft-Slot feature store 从 Stage3.4 `summary_fields` 中提取，当前包括显式数值状态，例如 `sdyn`、趋势、风险等。
-
-## 8. 从头构建 Stage3.2/Stage3.4
-
-如果已有 Stage3.2/Stage3.4 产物，可以跳过本节，直接看第 9 节。
-
-### 8.1 完整 pipeline 一次性运行
-
-以 MoocRadar 为例：
-
-```bash
-CUDA_VISIBLE_DEVICES=4 \
-python scripts/run_common_cognitive_pipeline_strict.py \
-  --problem_json datalocal/problem.json \
-  --student_json datalocal/student-problem-fine.json \
-  --out_root out/strict_common_pipeline
-```
-
-这会先跑 Stage3.2，再跑 Stage3.4，并最终生成：
-
-```text
-out/strict_common_pipeline/priors/stage32_manifest.json
-out/strict_common_pipeline/contexts/stage34_manifest.json
-out/strict_common_pipeline/contexts/contexts.jsonl
-out/strict_common_pipeline/cache/context_embeddings.pkl
-```
-
-### 8.2 分阶段运行
-
-大数据集不建议一次性重跑。建议分阶段。
-
-只跑 Stage3.2：
-
-```bash
-CUDA_VISIBLE_DEVICES=4 \
-python scripts/run_common_cognitive_pipeline_strict.py \
-  --problem_json <problem.json> \
-  --student_json <student-problem-fine.json> \
-  --out_root <out_root> \
-  --stop_after_stage32
-```
-
-复用 Stage3.2，只生成 Stage3.4 contexts，不生成 embeddings：
-
-```bash
-CUDA_VISIBLE_DEVICES=4 \
-python scripts/run_common_cognitive_pipeline_strict.py \
-  --problem_json <problem.json> \
-  --student_json <student-problem-fine.json> \
-  --out_root <out_root> \
-  --skip_stage32 \
-  --dry_run
-```
-
-复用 Stage3.2 和已有 contexts，生成最终 context embeddings：
-
-```bash
-CUDA_VISIBLE_DEVICES=4 \
-python scripts/run_common_cognitive_pipeline_strict.py \
-  --problem_json <problem.json> \
-  --student_json <student-problem-fine.json> \
-  --out_root <out_root> \
-  --skip_stage32 \
-  --reuse_existing_contexts
-```
-
-如果需要 Stage3.4 LLM summary：
-
-```bash
-CUDA_VISIBLE_DEVICES=4 \
-python scripts/run_common_cognitive_pipeline_strict.py \
-  --problem_json <problem.json> \
-  --student_json <student-problem-fine.json> \
-  --out_root <out_root> \
-  --skip_stage32 \
-  --reuse_existing_contexts \
-  --enable_llm_summary \
-  --llm_base_url http://127.0.0.1:8000/v1 \
-  --llm_model qwen3-8b \
-  --llm_timeout_sec 240 \
-  --llm_summary_workers 8 \
-  --dry_run
-```
-
-注意：
-
-- `--enable_llm_graph_completion` 属于 Stage3.2。
-- `--enable_llm_summary` 属于 Stage3.4。
-- Qwen3-Embedding/Reranker 由 Stage3.2/3.4 使用；Qwen3-8B 由 LLM summary 或 Soft-Slot Qwen 使用。
-
-## 9. 当前实验协议与泄漏边界
-
-当前 Soft-Slot 实验默认复用服务器已有 Stage3.2/Stage3.4 产物。feature store 会标记为：
-
-```text
-existing_stage34_transductive
-```
-
-这表示：
-
-- 目标样本划分使用 `new_concept`。
-- 但是 Stage3.2/Stage3.4 原始产物可能在生成时使用过测试概念或测试标签统计。
-- 因此当前结果应表述为 transductive feature setting。
-- 不能声明为严格无泄漏 new-concept。
-
-严格无泄漏版本需要保证：
-
-- Stage3.2 的监督训练只使用 train concepts。
-- Stage3.2 的协同统计只使用 train concepts 的交互。
-- Stage3.4 每个目标只使用 `target_t` 之前的历史。
-- 目标题真实 `is_correct` 不能进入 prompt 或 embedding。
-- checkpoint 选择不能使用测试标签，除非明确标注 test-selected。
-
-当前代码中的审计：
-
-```text
-feature_manifest.json -> audit
-leakage_audit.json
-```
-
-其中记录：
-
-```text
-protocol
-strict_new_concept_leakage_free
-noncausal_evidence_count
-target_label_stored_only_in_sample_label_field
-split_counts
-```
-
-## 10. Soft-Slot Feature Store
-
-Soft-Slot feature store 是 Stage3.2/Stage3.4 产物和 Qwen 训练代码之间的桥接层。
-
-入口：
-
-```text
-stage34_soft_slot_qwen_kt/scripts/prepare_soft_slot_embeddings.py
-```
-
-它做四件事：
-
-1. 读取 Stage3.4 `contexts.jsonl` 和 `context_embeddings.pkl`。
-2. 读取 Stage3.2 `priors/` 中的题目向量。
-3. 按 `new_concept` 规则给每个预测目标分配 train/test。
-4. 生成可按行读取的 `.npy` memmap 和 `samples.jsonl`。
-
-输出位于：
-
-```text
-stage34_soft_slot_qwen_kt/artifacts/<dataset>/features/
-```
-
-关键文件：
-
-| 文件 | 用途 |
+| 文件 | 作用 |
 |---|---|
-| `feature_manifest.json` | feature store 清单 |
-| `leakage_audit.json` | 泄漏审计摘要 |
-| `samples.jsonl` | 样本元信息和标签 |
-| `sample_offsets.npy` | `samples.jsonl` 行偏移索引 |
-| `split_codes.npy` | train/valid/test 编码 |
-| `stage34_numeric.npy` | 从 Stage3.4 summary_fields 提取的数值状态 |
-| `context_*.npy` | Stage3.4 context feature 矩阵 |
-| `target_*.npy` | Stage3.2 target feature 矩阵 |
+| `feature_manifest.json` | 记录字段、数组路径、shape、来源签名和题目索引 |
+| `samples.jsonl` | 保存样本三元组、标签、split 和可选上下文文本 |
+| `sample_offsets.npy` | 支持对 `samples.jsonl` 随机定位 |
+| `split_codes.npy` | 训练/验证/测试行索引编码 |
+| `context_*.npy` | 与预测样本逐行对齐的 Stage3.4 特征 |
+| `target_*.npy` | 与 `problem_ids` 对齐的 Stage3.2 题目特征 |
+| `stage34_numeric.npy` | Stage3.4 数值状态 |
 
-样本标签只保存在：
+`FeatureStore` 在读取时分别拼接所选 Context 字段和 Target 字段。这样新增或删除某一路特征时，不需要改动 Qwen 前向逻辑，只需要调整字段选择和输入维度。
 
-```text
-samples.jsonl -> label
-```
-
-标签不会作为 context slot、target slot 或 prompt 文本输入。
-
-## 11. 准备 Soft-Slot Feature Store
-
-MoocRadar：
-
-```bash
-python stage34_soft_slot_qwen_kt/scripts/prepare_soft_slot_embeddings.py \
-  --context_embeddings_path out/strict_common_pipeline/cache/context_embeddings.pkl \
-  --contexts_path out/strict_common_pipeline/contexts/contexts.jsonl \
-  --priors_dir out/strict_common_pipeline/priors \
-  --student_json datalocal/student-problem-fine.json \
-  --output_dir stage34_soft_slot_qwen_kt/artifacts/moocradar/features \
-  --context_fields llm_embeddings,llm_struct_features,stage34_numeric \
-  --target_fields hqtext,hqid,semantic,collaborative \
-  --test_concept_ratio 0.8 \
-  --valid_concept_ratio 0.0 \
-  --seed 42
-```
-
-XES3G5M：
-
-```bash
-python stage34_soft_slot_qwen_kt/scripts/prepare_soft_slot_embeddings.py \
-  --context_embeddings_path out/xes3g5m_strict_core20_common_pipeline/cache/context_embeddings.pkl \
-  --contexts_path out/xes3g5m_strict_core20_common_pipeline/contexts/contexts.jsonl \
-  --priors_dir out/xes3g5m_strict_core20_common_pipeline/priors \
-  --student_json datalocal/xes3g5m_strict_core20/student-problem-fine.json \
-  --output_dir stage34_soft_slot_qwen_kt/artifacts/xes3g5m/features \
-  --context_fields llm_embeddings,llm_struct_features,stage34_numeric \
-  --target_fields hqtext,hqid,semantic,collaborative \
-  --test_concept_ratio 0.8 \
-  --valid_concept_ratio 0.0 \
-  --seed 42
-```
-
-FoundationalASSIST：
-
-```bash
-python stage34_soft_slot_qwen_kt/scripts/prepare_soft_slot_embeddings.py \
-  --context_embeddings_path out/foundationalassist_text_only_core200_contextcomplete_common_pipeline/cache/context_embeddings.pkl \
-  --contexts_path out/foundationalassist_text_only_core200_contextcomplete_common_pipeline/contexts/contexts.jsonl \
-  --priors_dir out/foundationalassist_text_only_core200_contextcomplete_common_pipeline/priors \
-  --student_json datalocal/foundationalassist_text_only_core200_contextcomplete/student-problem-fine.json \
-  --output_dir stage34_soft_slot_qwen_kt/artifacts/foundationalassist/features \
-  --context_fields llm_embeddings,llm_struct_features,stage34_numeric \
-  --target_fields hqtext,hqid,semantic,collaborative \
-  --test_concept_ratio 0.8 \
-  --valid_concept_ratio 0.0 \
-  --seed 42
-```
-
-检查：
-
-```bash
-python -m json.tool stage34_soft_slot_qwen_kt/artifacts/moocradar/features/feature_manifest.json
-python -m json.tool stage34_soft_slot_qwen_kt/artifacts/xes3g5m/features/feature_manifest.json
-python -m json.tool stage34_soft_slot_qwen_kt/artifacts/foundationalassist/features/feature_manifest.json
-```
-
-## 12. Qwen Soft-Slot 模型
-
-主方法输入：
+### 5.3 主配置的数据契约
 
 ```text
-Context Slot:
+Context fields:
   llm_embeddings
   llm_struct_features
   stage34_numeric
 
-Target Slot:
+Target fields:
   hqtext
   hqid
   semantic
   collaborative
 ```
 
-主配置：
+`stage34_numeric` 当前是三维向量：`sdyn`、归一化的第一阶段候选数、归一化的最终证据数。
+
+## 6. Soft-Slot Qwen 的前向过程
+
+核心实现位于 `soft_slot_kt/model.py`。
+
+### 6.1 Projector
+
+Context 和 Target 各自使用一个 `SoftSlotProjector`：
 
 ```text
-slot_mode=context_target
-context_soft_tokens=4
-target_soft_tokens=2
-include_context_text=false
-prompt_version=compact_state_target_match_v1
-label_spec=A/B
+输入特征
+  → LayerNorm
+  → Linear(projector_hidden_dim)
+  → GELU
+  → Dropout
+  → Linear(num_soft_tokens × llm_hidden_dim)
+  → [batch, num_soft_tokens, llm_hidden_dim]
 ```
 
-Prompt 结构简化为：
+主配置使用 4 个 Context soft tokens 和 2 个 Target soft tokens。Projector 输出维度从 `llm.config.hidden_size` 获取，因此 slot 向量与 Qwen 的 token embedding 维度严格一致。
+
+### 6.2 Prompt 与 slot 替换
+
+`soft_slot_kt/prompts.py` 将 prompt 拆成三段：
 
 ```text
-知识追踪任务：结合学生当前认知状态与目标题要求，判断该学生本次作答更可能正确还是错误。
-学生状态表示：[Context soft slots]
-目标题：知识点=...；认知层级=...；题干=...
-目标题表示：[Target soft slots]
-输出标签：A=正确，B=错误。仅输出一个标签。
-标签：
+任务说明 + Context 占位位置
+目标题自然语言锚点 + Target 占位位置
+标签说明与“标签：”结尾
 ```
 
-模型不会生成完整文本。它只在 `标签：` 后读取：
+目标题自然语言锚点包含知识点、认知层级和题干。主配置 `include_context_text=false`，因此完整历史文本不直接进入 prompt；学生状态主要通过 Context soft slots 注入。
+
+Collator 记录两类占位位置的 mask。模型先用 Qwen 自身的 embedding layer 得到普通 token embeddings，再把 mask 对应位置替换成 projector 输出，最终调用：
+
+```python
+llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+```
+
+### 6.3 分类与损失
+
+默认标签语义是：
 
 ```text
-logit_A
-logit_B
+A = 正确
+B = 错误
 ```
 
-然后：
+如果候选标签是单 token，模型直接读取 prompt 最后位置的两个 token logits；若 tokenizer 将候选标签切成多个 token，代码会计算候选序列的平均 log-probability。
+
+随后构造：
 
 ```text
-P(correct) = exp(logit_A) / (exp(logit_A) + exp(logit_B))
+class_logits = [incorrect_score, correct_score]
+P(correct) = softmax(class_logits)[1]
+loss = cross_entropy(class_logits, label)
 ```
 
-## 13. 主实验训练与评估
+### 6.4 参数更新边界
 
-主流程：
+`SoftSlotQwenKT.__init__` 将所有 `llm.parameters()` 的 `requires_grad` 设为 `False`。训练脚本只把 `model.trainable_parameters()` 交给 AdamW，checkpoint 也只保存非 `llm.*` 的状态。
 
-1. `train_soft_slot_kt.py` 训练 projector，保存候选 checkpoint。
-2. `select_and_evaluate_soft_slot_kt.py` 用 50,000 个测试样本选择最佳 checkpoint。
-3. 用最佳 checkpoint 跑完整测试集。
+因此主实验真正学习的是 Context/Target projector，而不是 Qwen 权重。
 
-48GB GPU 推荐：
+## 7. Python 包职责
 
-```text
-BATCH_SIZE=8
-GRAD_ACCUM=1
-EVAL_BATCH_SIZE=32
-GRADIENT_CHECKPOINTING=0
-```
+| 文件 | 职责 |
+|---|---|
+| `soft_slot_kt/model.py` | 标签解析、projector、slot 替换、冻结 Qwen 前向和分类损失 |
+| `soft_slot_kt/prompts.py` | prompt 分段、占位位置编码、padding 和 slot masks |
+| `soft_slot_kt/data.py` | Feature Store、Dataset、Collator、Context/Target 特征拼接 |
+| `soft_slot_kt/prepare.py` | 对齐 Stage3.2/Stage3.4 产物并物化特征数组 |
+| `soft_slot_kt/runtime.py` | 加载冻结 LLM、组装数据与模型、评估、checkpoint 读写 |
+| `soft_slot_kt/source_io.py` | 读取并按时间排序学生序列 |
+| `soft_slot_kt/cli.py` | 统一模型和数据参数定义 |
+| `soft_slot_kt/utils.py` | 指标、随机种子、设备、dtype 和原子写入等公共函数 |
 
-24GB GPU 推荐：
+## 8. 脚本入口分别负责什么
 
-```text
-BATCH_SIZE=4
-GRAD_ACCUM=2
-EVAL_BATCH_SIZE=16
-GRADIENT_CHECKPOINTING=1
-```
+| 脚本 | 角色 |
+|---|---|
+| `scripts/prepare_soft_slot_embeddings.py` | 建立上游产物到 Feature Store 的桥接 |
+| `scripts/train_soft_slot_kt.py` | 训练有 projector 的 soft-slot 配置 |
+| `scripts/infer_soft_slot_kt.py` | 运行无需训练 projector 的 `text_only` 或固定随机 slot 等路径，也可加载已训练 checkpoint 推理 |
+| `scripts/select_and_evaluate_soft_slot_kt.py` | 比较候选 checkpoint，并输出逐样本概率与汇总指标 |
+| `scripts/run_*_full.sh` | 三个数据集的实验参数封装，不包含核心算法 |
+| `scripts/run_*_smoke.sh` | 小规模接口检查封装，不代表正式实验逻辑 |
 
-XES3G5M：
+核心逻辑应优先在 `soft_slot_kt/` 中阅读，shell 脚本主要是参数组合。
 
-```bash
-CUDA_VISIBLE_DEVICES=5 \
-BATCH_SIZE=4 \
-GRAD_ACCUM=2 \
-EVAL_BATCH_SIZE=16 \
-GRADIENT_CHECKPOINTING=1 \
-EPOCHS=10 \
-SAVE_EPOCHS=2,4,6,8,10 \
-CANDIDATE_EPOCHS=2,4,6,8,10 \
-SELECTION_ONLY=0 \
-bash stage34_soft_slot_qwen_kt/scripts/run_xes3g5m_full.sh
-```
+## 9. 各实验模式在回答什么问题
 
-FoundationalASSIST：
+`runtime.slot_counts()` 定义了五种输入模式：
 
-```bash
-CUDA_VISIBLE_DEVICES=4 \
-BATCH_SIZE=8 \
-GRAD_ACCUM=1 \
-EVAL_BATCH_SIZE=32 \
-GRADIENT_CHECKPOINTING=0 \
-EPOCHS=10 \
-SAVE_EPOCHS=2,4,6,8,10 \
-CANDIDATE_EPOCHS=2,4,6,8,10 \
-SELECTION_ONLY=0 \
-bash stage34_soft_slot_qwen_kt/scripts/run_foundationalassist_full.sh
-```
-
-MoocRadar `learning_rate=5e-5` 主实验：
-
-```bash
-CUDA_VISIBLE_DEVICES=4 \
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-python stage34_soft_slot_qwen_kt/scripts/train_soft_slot_kt.py \
-  --feature_dir stage34_soft_slot_qwen_kt/artifacts/moocradar/features \
-  --model_name_or_path qwen/Qwen3-8B \
-  --output_dir stage34_soft_slot_qwen_kt/checkpoints/moocradar/context_target_slots_only_lr5e5 \
-  --slot_mode context_target \
-  --context_fields llm_embeddings,llm_struct_features,stage34_numeric \
-  --target_fields hqtext,hqid,semantic,collaborative \
-  --context_soft_tokens 4 \
-  --target_soft_tokens 2 \
-  --no-include_context_text \
-  --epochs 10 \
-  --save_epochs 2,4,6,8,10 \
-  --learning_rate 5e-5 \
-  --validation_disabled \
-  --dtype bfloat16 \
-  --attn_implementation sdpa \
-  --batch_size 8 \
-  --eval_batch_size 32 \
-  --gradient_accumulation_steps 1 \
-  --no-gradient_checkpointing \
-  --resume auto \
-  --seed 42
-```
-
-MoocRadar checkpoint 筛选和完整测试：
-
-```bash
-CUDA_VISIBLE_DEVICES=4 \
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-python stage34_soft_slot_qwen_kt/scripts/select_and_evaluate_soft_slot_kt.py \
-  --feature_dir stage34_soft_slot_qwen_kt/artifacts/moocradar/features \
-  --model_name_or_path qwen/Qwen3-8B \
-  --checkpoints stage34_soft_slot_qwen_kt/checkpoints/moocradar/context_target_slots_only_lr5e5/checkpoint_epoch_2.pt,stage34_soft_slot_qwen_kt/checkpoints/moocradar/context_target_slots_only_lr5e5/checkpoint_epoch_4.pt,stage34_soft_slot_qwen_kt/checkpoints/moocradar/context_target_slots_only_lr5e5/checkpoint_epoch_6.pt,stage34_soft_slot_qwen_kt/checkpoints/moocradar/context_target_slots_only_lr5e5/checkpoint_epoch_8.pt,stage34_soft_slot_qwen_kt/checkpoints/moocradar/context_target_slots_only_lr5e5/checkpoint_epoch_10.pt \
-  --output_dir stage34_soft_slot_qwen_kt/results/moocradar/context_target_slots_only_lr5e5 \
-  --slot_mode context_target \
-  --context_fields llm_embeddings,llm_struct_features,stage34_numeric \
-  --target_fields hqtext,hqid,semantic,collaborative \
-  --context_soft_tokens 4 \
-  --target_soft_tokens 2 \
-  --no-include_context_text \
-  --selection_limit 50000 \
-  --dtype bfloat16 \
-  --attn_implementation sdpa \
-  --eval_batch_size 32 \
-  --seed 42
-```
-
-## 14. 输出结果
-
-完整测试指标：
-
-```text
-stage34_soft_slot_qwen_kt/results/<dataset>/<run_name>/metrics.test.full.json
-```
-
-候选 checkpoint 筛选：
-
-```text
-stage34_soft_slot_qwen_kt/results/<dataset>/<run_name>/checkpoint_selection.json
-```
-
-逐样本预测：
-
-```text
-stage34_soft_slot_qwen_kt/results/<dataset>/<run_name>/predictions.test.full.jsonl
-```
-
-逐样本预测格式：
-
-```json
-{
-  "row": 123,
-  "user_id": "student",
-  "target_t": 10,
-  "target_pid": "problem",
-  "label": 1,
-  "split": "test",
-  "probability": 0.8734,
-  "prediction": 1
-}
-```
-
-查看指标：
-
-```bash
-python -m json.tool stage34_soft_slot_qwen_kt/results/moocradar/context_target_slots_only_lr5e5/metrics.test.full.json
-python -m json.tool stage34_soft_slot_qwen_kt/results/xes3g5m/context_target_slots_only/metrics.test.full.json
-python -m json.tool stage34_soft_slot_qwen_kt/results/foundationalassist/context_target_slots_only/metrics.test.full.json
-```
-
-## 15. 断点恢复
-
-训练恢复：
-
-- `--resume auto` 从 `checkpoint_last.pt` 恢复。
-- `training_complete.json` 存在且 epoch 足够时自动跳过训练。
-- 中断发生在未保存 epoch 中间时，该 epoch 需要重跑。
-
-评估恢复：
-
-- `checkpoint_selection.json` 记录已完成的候选 checkpoint。
-- `predictions.test.full.jsonl` 记录完整测试已完成样本。
-- 重新执行相同评估命令会跳过已完成部分。
-- `metrics.test.full.json` 存在表示完整评估已结束。
-
-检查完整测试进度：
-
-```bash
-wc -l stage34_soft_slot_qwen_kt/results/moocradar/context_target_slots_only_lr5e5/predictions.test.full.jsonl
-```
-
-MoocRadar full test 总数约为：
-
-```text
-818197
-```
-
-
-
-## 16. 消融实验
-
-消融实验要回答三个问题：
-
-1. Soft slots 是否真的带来有效信息。
-2. Stage3.2 目标题先验和 Stage3.4 学生状态各自贡献多少。
-3. 当前 soft-token 结构是否合理。
-
-### 16.1 必做消融
-
-建议三个数据集都做：
-
-| Variant | 目的 | 参数 |
+| `slot_mode` | 输入 | 用途 |
 |---|---|---|
-| Text-only Qwen | 无 soft slots；仅用任务说明和目标题自然语言信息 | `--slot_mode text_only` |
-| Target slot only | 验证 Stage3.2 目标题先验 slot | `--slot_mode target` |
-| Context slot only | 验证 Stage3.4 学生状态 slot；仍保留目标题自然语言锚点 | `--slot_mode context` |
-| Full Soft-Slot | 主方法 | `--slot_mode context_target` |
-| Fixed random slots | 固定随机 soft slots 负对照；检验 slot 位置/提示形式本身是否带来虚假提升 | `--slot_mode random` |
-| w/o sdyn | 验证显式动态状态贡献 | `--drop_sdyn` |
-| w/o collaborative | 验证协同题目先验贡献 | `--drop_collab` 或去掉 `collaborative` |
-| w/o hqid | 验证分层语义 ID 向量贡献 | `--target_fields hqtext,semantic,collaborative` |
+| `text_only` | 无 soft slots | 检查自然语言题面和标签提示本身能提供多少信息 |
+| `context` | 仅 Context slots | 检查学生状态表示的贡献 |
+| `target` | 仅 Target slots | 检查题目侧先验的贡献 |
+| `context_target` | Context + Target slots | 当前完整主配置 |
+| `random` | 固定随机 Context + Target slots | 检查 slot 位置和提示形式本身是否造成虚假收益 |
 
-注意：
+其中 `random` 使用注册为 buffer 的固定随机向量，没有可训练 projector，因此它是输入位置/形式的负对照，不是参数量匹配的容量对照。
 
-- `text_only` 没有 soft slots，没有可训练 projector，使用 `infer_soft_slot_kt.py`。
-- 当前 `random` 是固定随机 slots，也没有可训练 projector，使用 `infer_soft_slot_kt.py`。
-- 当前 `random` 不是“可训练参数容量”对照；如果要控制 projector 容量，应另做 shuffled features 或 random features + trainable projector 实验。
-- `hqid` 是 hierarchical semantic ID vector，不是原始题目 ID embedding。
-- `w/o sdyn` 只清零显式 `stage34_numeric` 中的 `sdyn`。已有文本 embedding 可能仍间接包含动态信息。
-- `w/o collaborative` 只移除显式 collaborative embedding。已有 Stage3.4 context 可能仍间接编码协同信息。
+字段级消融通过选择 Context/Target 字段以及 `drop_sdyn`、`drop_collab` 实现。它们用于判断性能来自哪类认知信息，而不是另一条主模型路径。
 
-### 16.2 Stage3.4 学生状态消融
-
-| Variant | 参数 |
-|---|---|
-| only llm_embeddings | `--context_fields llm_embeddings` |
-| only struct features | `--context_fields llm_struct_features` |
-| only numeric | `--context_fields stage34_numeric` |
-| w/o llm_embeddings | `--context_fields llm_struct_features,stage34_numeric` |
-| w/o struct features | `--context_fields llm_embeddings,stage34_numeric` |
-| w/o numeric | `--context_fields llm_embeddings,llm_struct_features` |
-| w/o sdyn | `--drop_sdyn` |
-
-优先级最高：
+## 10. 产物如何对应代码阶段
 
 ```text
-only llm_embeddings
-w/o llm_struct_features
-w/o sdyn
+artifacts/<dataset>/features/
+  Feature Store：上游产物经过对齐后的模型输入
+
+checkpoints/<dataset>/<run>/
+  Projector 状态、优化器状态和训练元数据
+
+results/<dataset>/<run>/predictions*.jsonl
+  逐样本 user/target、真实标签、预测概率与预测类别
+
+results/<dataset>/<run>/metrics*.json
+  AUC、ACC、F1、BCE、RMSE 等汇总指标
 ```
 
-### 16.3 Stage3.2 目标题先验消融
+这些目录分别对应“输入契约、可训练参数、逐样本输出、汇总结果”，不应混作同一类实验文件。
 
-| Variant | 参数 |
-|---|---|
-| only hqtext | `--target_fields hqtext` |
-| only hqid | `--target_fields hqid` |
-| only semantic | `--target_fields semantic` |
-| only collaborative | `--target_fields collaborative` |
-| w/o hqtext | `--target_fields hqid,semantic,collaborative` |
-| w/o hqid | `--target_fields hqtext,semantic,collaborative` |
-| w/o semantic | `--target_fields hqtext,hqid,collaborative` |
-| w/o collaborative | `--target_fields hqtext,hqid,semantic` |
+## 11. 建议的阅读顺序
 
-这里的 `hqid` 表示分层语义 ID 向量，不是原始题目 ID。最有价值的三项：
+1. `soft_slot_kt/model.py`：先理解 projector、slot 替换和 A/B logits；
+2. `soft_slot_kt/prompts.py`：理解 soft slots 在 prompt 中的位置；
+3. `soft_slot_kt/data.py`：理解 Feature Store 如何变成 batch；
+4. `soft_slot_kt/prepare.py`：理解上游特征如何对齐；
+5. `../scripts/common_pipeline_strict/stage34.py`：理解证据检索和结构化总结；
+6. `../scripts/common_pipeline_strict/stage32.py`：理解题目侧先验；
+7. `soft_slot_kt/runtime.py` 和 `scripts/`：理解训练与评估编排。
 
-```text
-only collaborative
-w/o hqid
-w/o collaborative
-```
+## 12. 容易混淆的边界
 
-### 16.4 Slot 数量消融
-
-建议先只在 MoocRadar 做：
-
-| Variant | 参数 |
-|---|---|
-| 1+1 | `--context_soft_tokens 1 --target_soft_tokens 1` |
-| 2+1 | `--context_soft_tokens 2 --target_soft_tokens 1` |
-| 4+2 | 当前主方法 |
-| 8+4 | `--context_soft_tokens 8 --target_soft_tokens 4` |
-
-### 16.5 训练策略消融
-
-建议：
-
-- 主方法跑 seed 42/43/44。
-- 关键消融只跑 seed 42。
-- learning rate 比较 `1e-4`、`5e-5`、`2e-5`。
-- 候选 checkpoint 使用 `2,4,6,8,10`，避免错过早期最优点。
-
-## 17. 消融命令模板
-
-训练类消融：
-
-```bash
-CUDA_VISIBLE_DEVICES=4 \
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-python stage34_soft_slot_qwen_kt/scripts/train_soft_slot_kt.py \
-  --feature_dir stage34_soft_slot_qwen_kt/artifacts/moocradar/features \
-  --model_name_or_path qwen/Qwen3-8B \
-  --output_dir stage34_soft_slot_qwen_kt/checkpoints/moocradar/ABLATION_NAME \
-  --slot_mode context_target \
-  --context_fields llm_embeddings,llm_struct_features,stage34_numeric \
-  --target_fields hqtext,hqid,semantic,collaborative \
-  --context_soft_tokens 4 \
-  --target_soft_tokens 2 \
-  --no-include_context_text \
-  --epochs 10 \
-  --save_epochs 2,4,6,8,10 \
-  --learning_rate 5e-5 \
-  --validation_disabled \
-  --dtype bfloat16 \
-  --attn_implementation sdpa \
-  --batch_size 8 \
-  --eval_batch_size 32 \
-  --gradient_accumulation_steps 1 \
-  --no-gradient_checkpointing \
-  --resume auto \
-  --seed 42
-```
-
-对应评估：
-
-```bash
-CUDA_VISIBLE_DEVICES=4 \
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-python stage34_soft_slot_qwen_kt/scripts/select_and_evaluate_soft_slot_kt.py \
-  --feature_dir stage34_soft_slot_qwen_kt/artifacts/moocradar/features \
-  --model_name_or_path qwen/Qwen3-8B \
-  --checkpoints stage34_soft_slot_qwen_kt/checkpoints/moocradar/ABLATION_NAME/checkpoint_epoch_2.pt,stage34_soft_slot_qwen_kt/checkpoints/moocradar/ABLATION_NAME/checkpoint_epoch_4.pt,stage34_soft_slot_qwen_kt/checkpoints/moocradar/ABLATION_NAME/checkpoint_epoch_6.pt,stage34_soft_slot_qwen_kt/checkpoints/moocradar/ABLATION_NAME/checkpoint_epoch_8.pt,stage34_soft_slot_qwen_kt/checkpoints/moocradar/ABLATION_NAME/checkpoint_epoch_10.pt \
-  --output_dir stage34_soft_slot_qwen_kt/results/moocradar/ABLATION_NAME \
-  --slot_mode context_target \
-  --context_fields llm_embeddings,llm_struct_features,stage34_numeric \
-  --target_fields hqtext,hqid,semantic,collaborative \
-  --context_soft_tokens 4 \
-  --target_soft_tokens 2 \
-  --no-include_context_text \
-  --selection_limit 50000 \
-  --dtype bfloat16 \
-  --attn_implementation sdpa \
-  --eval_batch_size 32 \
-  --seed 42
-```
-
-Text-only 推理：
-
-```bash
-CUDA_VISIBLE_DEVICES=4 \
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-python stage34_soft_slot_qwen_kt/scripts/infer_soft_slot_kt.py \
-  --feature_dir stage34_soft_slot_qwen_kt/artifacts/moocradar/features \
-  --model_name_or_path qwen/Qwen3-8B \
-  --output_dir stage34_soft_slot_qwen_kt/results/moocradar/text_only \
-  --slot_mode text_only \
-  --context_fields llm_embeddings,llm_struct_features,stage34_numeric \
-  --target_fields hqtext,hqid,semantic,collaborative \
-  --no-include_context_text \
-  --split test \
-  --dtype bfloat16 \
-  --attn_implementation sdpa \
-  --eval_batch_size 32 \
-  --seed 42
-```
-
-Fixed random slots 推理：
-
-```bash
-CUDA_VISIBLE_DEVICES=4 \
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-python stage34_soft_slot_qwen_kt/scripts/infer_soft_slot_kt.py \
-  --feature_dir stage34_soft_slot_qwen_kt/artifacts/moocradar/features \
-  --model_name_or_path qwen/Qwen3-8B \
-  --output_dir stage34_soft_slot_qwen_kt/results/moocradar/random_slots \
-  --slot_mode random \
-  --context_fields llm_embeddings,llm_struct_features,stage34_numeric \
-  --target_fields hqtext,hqid,semantic,collaborative \
-  --context_soft_tokens 4 \
-  --target_soft_tokens 2 \
-  --no-include_context_text \
-  --split test \
-  --dtype bfloat16 \
-  --attn_implementation sdpa \
-  --eval_batch_size 32 \
-  --seed 42
-```
-
-推荐 run name：
-
-```text
-text_only
-target_only
-context_only
-context_target_full
-fixed_random_slots
-wo_sdyn
-wo_collab
-wo_hqid
-only_llm_embeddings
-wo_llm_struct
-only_collab
-tokens_1_1
-tokens_2_1
-tokens_8_4
-```
-
-## 18. 质量检查清单
-
-Stage3.2：
-
-```bash
-python scripts/check_stage32_artifacts.py \
-  --out_root <out_root>
-```
-
-Stage3.4：
-
-```bash
-python scripts/validate_common_pipeline_strict.py \
-  --problem_json <problem.json> \
-  --out_root <out_root>
-```
-
-Soft-Slot feature store：
-
-```bash
-python -m json.tool stage34_soft_slot_qwen_kt/artifacts/<dataset>/features/feature_manifest.json
-python -m json.tool stage34_soft_slot_qwen_kt/artifacts/<dataset>/features/leakage_audit.json
-```
-
-确认标签没有进入 prompt：
-
-```text
-feature_manifest.json -> audit.target_label_stored_only_in_sample_label_field = true
-```
-
-确认 Stage3.4 证据没有使用目标之后的历史：
-
-```text
-feature_manifest.json -> audit.noncausal_evidence_count = 0
-```
-
-## 19. 本地开发检查
-
-本地 Windows 只做静态检查和 mock 测试，不加载 Qwen3-8B：
-
-```powershell
-python -m compileall stage34_soft_slot_qwen_kt
-python -m unittest discover -s stage34_soft_slot_qwen_kt\tests -p test_soft_slot_kt.py -v
-```
-
-## 20. 常见误区
-
-- 当前主方法不是 KT baseline 融合。
-- 当前主方法不输入完整 Stage3.4 历史文本。
-- 当前主方法不让 Qwen 生成概率文本。
-- `A/B` 是分类标签 token，不是自然语言答案。
-- `checkpoint_selection.json` 使用测试标签筛选 checkpoint，必须在论文中标注 `selection_uses_test_labels=true`。
-- `existing_stage34_transductive` 不是严格无泄漏协议。
-- `--enable_llm_graph_completion` 是 Stage3.2，`--enable_llm_summary` 是 Stage3.4。
-- `question_level` 不是认知层级 `cognitive_dimension`。
-
-## 21. 推荐论文表述
-
-主方法描述：
-
-```text
-We freeze Qwen3-8B and train only lightweight projectors that map Stage3.4 student-state embeddings and Stage3.2 target-problem priors into the Qwen token embedding space. The projected vectors replace placeholder positions in a compact prompt as soft slots. Instead of asking the LLM to generate probabilities, we compute P(correct) from the logits of two fixed label tokens, A and B.
-```
-
-协议描述：
-
-```text
-The reported Soft-Slot Qwen results use a new-concept target split with existing Stage3.2/Stage3.4 transductive features. They should not be interpreted as strict leakage-free new-concept results unless Stage3.2/Stage3.4 are regenerated under train-only supervision and statistics.
-```
-
-消融结论链：
-
-```text
-1. Text-only < Soft-Slot: embedding slots are necessary.
-2. Context-only and Target-only are both useful; Full is best: student state and target prior are complementary.
-3. Fixed random slots < Full: gains come from Stage3.2/Stage3.4 information, not merely placeholder positions.
-4. w/o sdyn, w/o collaborative, and w/o hqid quantify the contributions of dynamic state, collaborative prior, and hierarchical semantic-ID prior.
-```
+- `stage34_soft_slot_qwen_kt/` 是当前主实验；`train_context.py` 中的 KT 模型是对照路径。
+- Stage3.4 的总结 LLM 与 Soft-Slot Qwen 是两个模型阶段：前者压缩证据，后者预测正确率。
+- Stage3.4 检索使用固定评分逻辑；可训练参数位于下游 projector。
+- 主配置不输入完整历史文本，`include_context_text` 只用于相应对照。
+- Qwen 不输出 JSON 或自然语言概率，最终输出来自标签 token logits。
+- Context 与 Target 特征在进入 projector 前分别拼接，二者不会共用同一个投影器。
+- `A/B` 是分类标签，不是学生的原始作答内容。
